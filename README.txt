@@ -34,7 +34,6 @@ PROJECT STRUCTURE
   run_monitor.py       - Entry point. Configures and launches the monitor.
   price_monitor.py     - Core monitoring loop. Orchestrates fetching and storage.
   jupiter_api.py       - Primary Jupiter API client (Price v3 + Quote v1).
-  jupiter_client.py    - Legacy Jupiter API client (retained for compatibility).
   token_registry.py    - Token definitions, mint addresses, decimals, categories.
   data_exporter.py     - Excel export logic for prices, quotes, and summaries.
   requirements.txt     - Python package dependencies.
