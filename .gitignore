@@ -1,0 +1,4 @@
+.env
+price_history/
+__pycache__/
+*.pyc
