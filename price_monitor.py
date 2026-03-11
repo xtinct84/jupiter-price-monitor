@@ -8,6 +8,7 @@ from collections import defaultdict
 from jupiter_api import JupiterAPI
 from token_registry import TokenRegistry
 from data_exporter import DataExporter
+from arbitrage_detector import run_detection
 
 logging.basicConfig(
     level=logging.INFO,
@@ -225,6 +226,9 @@ class PriceMonitor:
                 
                 await self.fetch_and_store_prices()
                 await self.fetch_and_store_quotes()
+                
+                # Run arbitrage detection after every fetch cycle
+                await run_detection()
                 
                 # Print database stats every 10 iterations
                 if iteration % 10 == 0:
