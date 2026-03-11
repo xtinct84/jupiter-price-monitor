@@ -51,7 +51,7 @@ DB_PATH = Path("price_history/jupiter_monitor.db")
 
 # --- Execution gate thresholds ---
 EXECUTE_THRESHOLD  = 75   # Score >= this → auto-execute candidate
-ANALYSIS_THRESHOLD = 40   # Score >= this → request LLM analysis
+ANALYSIS_THRESHOLD = 51   # Score > 50% of 100pts — strict quality gate
 # Score < ANALYSIS_THRESHOLD → discard silently
 
 # --- Condition weights (must sum to 100) ---
@@ -821,12 +821,22 @@ async def run_detection():
         signal = enrich_signal_with_validation(signal, quote_legs)
 
         log_signal(conn, signal)
-        await send_telegram_alert(signal)
+
+        # Telegram only for execute candidates — score >= 75 AND validator EXECUTE
+        if (signal.get('weighted_score', 0) >= EXECUTE_THRESHOLD
+                and signal.get('execute_candidate', False)):
+            await send_telegram_alert(signal)
+        else:
+            logger.info(
+                f"📵 No alert: {signal['pair']} | "
+                f"Score {signal['weighted_score']}pts | "
+                f"Validation: {signal.get('validation').recommendation if signal.get('validation') else 'N/A'}"
+            )
 
     conn.close()
 
     execute_count  = sum(1 for s in all_signals
-                         if s['weighted_score'] >= EXECUTE_THRESHOLD)
+                         if s.get('execute_candidate', False))
     analysis_count = sum(1 for s in all_signals
                          if ANALYSIS_THRESHOLD <= s['weighted_score'] < EXECUTE_THRESHOLD)
 
@@ -847,7 +857,7 @@ if __name__ == "__main__":
     ╚══════════════════════════════════════════════════════════════╝
     """)
     print(f"  Execute threshold:       {EXECUTE_THRESHOLD}/100 pts")
-    print(f"  Analysis threshold:      {ANALYSIS_THRESHOLD}/100 pts")
+    print(f"  Analysis threshold:      {ANALYSIS_THRESHOLD}/100 pts  (>50% gate)")
     print(f"  Min profit (divergence): {MIN_PROFIT_RATE_DIVERGENCE}%  [MEV buffer: direct 2-step]")
     print(f"  Min profit (triangular): {MIN_PROFIT_TRIANGULAR}%   [MEV buffer: multi-hop]")
     print(f"  Min profit (impact):     {MIN_PROFIT_IMPACT_ANOMALY}%  [MEV buffer: liquidity shift]")
