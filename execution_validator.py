@@ -62,6 +62,11 @@ SOLANA_TX_FEE_USD          = 0.0004    # ~0.000005 SOL at $85 per SOL
 # Strategy-specific net profit thresholds
 NET_PROFIT_THRESHOLD_DIRECT      = 1.5   # Direct 2-leg trades (rate divergence, impact anomaly)
 NET_PROFIT_THRESHOLD_TRIANGULAR  = 1.0   # Triangular 3-leg trades (higher fee burden, better MEV protection)
+
+# 3:1 ratio formula constants
+DESIRED_NET_PROFIT_PCT     = 0.5       # Minimum acceptable net profit per trade
+MIN_GROSS_SLIPPAGE_RATIO   = 3.0       # Gross must be >= 3x derived slippage tolerance
+DYNAMIC_SLIPPAGE_BUFFER    = 0.8       # Execution slippage = derived_tolerance * this
 DYNAMIC_SLIPPAGE_BUFFER    = 0.8       # dynamic_slippage = net_profit * this
 
 # =============================================================================
@@ -123,12 +128,14 @@ class ValidationResult:
             f"Gross profit    : {self.gross_profit_pct:.4f}%",
             f"Implied depth   : ${self.implied_depth_usd:,.0f} "
             f"({self.liquidity_ratio:.1f}x capital) [{self.liquidity_tier}]",
-            f"Sim. slippage   : {self.simulated_slippage_pct:.4f}% "
-            f"({self.legs} legs)",
-            f"Fees            : {self.fee_pct:.4f}%",
+            f"Worst-leg slip  : {self.simulated_slippage_pct:.4f}%",
+            f"Derived tol.    : (gross {self.gross_profit_pct:.4f}% - fees "
+            f"{self.fee_pct:.4f}% - net {DESIRED_NET_PROFIT_PCT}%) / 2",
+            f"Effective slip  : {self.slippage_pct:.4f}% (max of worst-leg vs derived)",
+            f"Fees            : {self.fee_pct:.4f}% ({self.legs} legs x {JUPITER_PLATFORM_FEE_PCT}%)",
             f"Net profit      : {self.net_profit_pct:.4f}%",
-            f"Dyn. slippage   : {self.dynamic_slippage_bps}bps "
-            f"(= net * {DYNAMIC_SLIPPAGE_BUFFER})",
+            f"Dyn. slip. set  : {self.dynamic_slippage_bps}bps "
+            f"(derived_tol * {DYNAMIC_SLIPPAGE_BUFFER})",
             f"Recommendation  : {self.recommendation}",
         ]
         if not self.passed:
@@ -186,6 +193,52 @@ def get_liquidity_tier(ratio: float) -> str:
 # =============================================================================
 # SLIPPAGE SIMULATION
 # =============================================================================
+
+def derive_slippage_tolerance(gross_pct: float,
+                               fees_pct: float,
+                               desired_net_pct: float = DESIRED_NET_PROFIT_PCT) -> float:
+    """
+    Derive the maximum safe slippage tolerance using the formula:
+        Slippage Tolerance = (Gross% - Fees% - Desired Net%) / 2
+
+    A negative result means gross profit is insufficient to cover
+    fees + desired net even with zero slippage — reject immediately.
+
+    Args:
+        gross_pct:       Gross profit percentage
+        fees_pct:        Total fees across all legs
+        desired_net_pct: Minimum acceptable net profit
+
+    Returns:
+        Maximum safe slippage % (negative = reject)
+    """
+    try:
+        tolerance = (Decimal(str(gross_pct))
+                     - Decimal(str(fees_pct))
+                     - Decimal(str(desired_net_pct))) / Decimal('2')
+        return float(tolerance)
+    except Exception:
+        return -1.0
+
+
+def check_slippage_ratio(gross_pct: float,
+                          slippage_tolerance: float) -> tuple:
+    """
+    Check whether gross profit satisfies the 3:1 ratio vs slippage.
+
+    Returns:
+        (ratio: float, passes: bool, warning: str)
+    """
+    if slippage_tolerance <= 0:
+        return 0.0, False, 'Slippage tolerance negative'
+    ratio = gross_pct / slippage_tolerance
+    passes = ratio >= MIN_GROSS_SLIPPAGE_RATIO
+    warning = (
+        f'OK ({ratio:.1f}:1)' if passes
+        else f'WARN — {ratio:.1f}:1 below {MIN_GROSS_SLIPPAGE_RATIO}:1 target'
+    )
+    return ratio, passes, warning
+
 
 def simulate_leg_slippage(price_impact_pct: float,
                            capital_usd: float,
@@ -359,51 +412,76 @@ def validate_signal(signal: dict,
     result.liquidity_gate_passed = True
 
     # ─────────────────────────────────────────────
-    # STAGE 3 — Slippage Simulation Per Leg
+    # STAGE 3 — Worst-Leg Slippage Simulation
     # ─────────────────────────────────────────────
     result.stage_reached = 3
     result.legs = num_legs
 
-    # Estimate quote capital from stored quote (approximate as $50)
-    # This is the reference size our stored quotes were generated at
     quote_capital_estimate = 50.0
 
     if result.liquidity_tier == "SAFE":
-        # Deep market — use standard assumption
-        simulated_slippage = 0.5 * num_legs  # 0.5% per leg assumption
+        # Deep market — worst-leg assumption at 0.5%
+        worst_leg_slippage = 0.5
         logger.info(
-            f"  Stage 3: SAFE tier — using standard "
-            f"{0.5}% * {num_legs} legs = {simulated_slippage:.4f}%"
+            f"  Stage 3: SAFE tier — worst-leg assumption {worst_leg_slippage}%"
         )
     else:
-        # SIMULATE tier — calculate from actual price impact data
-        simulated_slippage = simulate_total_slippage(
-            impacts, result.capital_usd, quote_capital_estimate
+        # SIMULATE tier — worst leg = highest price impact scaled to capital
+        worst_leg_slippage = simulate_leg_slippage(
+            thinnest_impact, result.capital_usd, quote_capital_estimate
         )
         logger.info(
             f"  Stage 3: SIMULATE tier — "
-            f"computed slippage {simulated_slippage:.4f}% across {num_legs} legs"
+            f"worst-leg slippage {worst_leg_slippage:.4f}%"
         )
 
-    result.simulated_slippage_pct = simulated_slippage
+    result.simulated_slippage_pct = worst_leg_slippage
 
     # ─────────────────────────────────────────────
-    # STAGE 4 — Net Profit Calculation
+    # STAGE 4 — Net Profit + Dynamic Slippage Formula
+    # Formula: Slippage Tolerance = (Gross - Fees - Desired Net) / 2
     # ─────────────────────────────────────────────
     result.stage_reached = 4
 
     fee_pct = calculate_fees_pct(result.capital_usd, num_legs)
-    net_profit = gross_profit - simulated_slippage - fee_pct
 
-    result.gross_pct     = gross_profit
-    result.fee_pct       = fee_pct
-    result.slippage_pct  = simulated_slippage
-    result.net_profit_pct = net_profit
+    # Derive safe slippage tolerance from formula
+    derived_tolerance = derive_slippage_tolerance(gross_profit, fee_pct)
+
+    # Reject if formula yields negative tolerance
+    # (gross can't cover fees + desired net even with zero slippage)
+    if derived_tolerance <= 0:
+        result.reject_reason = (
+            f"Insufficient gross {gross_profit:.4f}%: cannot cover "
+            f"fees {fee_pct:.4f}% + desired net {DESIRED_NET_PROFIT_PCT}% "
+            f"(tolerance = {derived_tolerance:.4f}%)"
+        )
+        result.recommendation = "REJECT"
+        result.gross_pct = gross_profit
+        result.fee_pct = fee_pct
+        logger.info(f"  Stage 4 FAIL: {result.reject_reason}")
+        return result
+
+    # Check 3:1 ratio (warning only — does not reject)
+    ratio, ratio_ok, ratio_msg = check_slippage_ratio(gross_profit, derived_tolerance)
+
+    # Net profit using worst-leg slippage against derived tolerance
+    # Use the more conservative of: worst-leg sim vs derived tolerance
+    effective_slippage = max(worst_leg_slippage, derived_tolerance)
+    net_profit = gross_profit - effective_slippage - fee_pct
+
+    result.gross_pct          = gross_profit
+    result.fee_pct            = fee_pct
+    result.slippage_pct       = effective_slippage
+    result.net_profit_pct     = net_profit
 
     logger.info(
-        f"  Stage 4: gross {gross_profit:.4f}% - "
-        f"slippage {simulated_slippage:.4f}% - "
-        f"fees {fee_pct:.4f}% = net {net_profit:.4f}%"
+        f"  Stage 4: gross {gross_profit:.4f}% | "
+        f"derived tolerance {derived_tolerance:.4f}% | "
+        f"worst-leg {worst_leg_slippage:.4f}% | "
+        f"effective slippage {effective_slippage:.4f}% | "
+        f"fees {fee_pct:.4f}% | net {net_profit:.4f}% | "
+        f"ratio {ratio_msg}"
     )
 
     # ─────────────────────────────────────────────
@@ -420,8 +498,9 @@ def validate_signal(signal: dict,
         logger.info(f"  Stage 5 FAIL: negative net profit")
         return result
 
-    # Dynamic slippage = net_profit * buffer, expressed in basis points
-    dynamic_slippage_pct = net_profit * DYNAMIC_SLIPPAGE_BUFFER
+    # Dynamic slippage = derived_tolerance * buffer, expressed in basis points
+    # Using derived_tolerance (not net_profit) keeps it anchored to formula
+    dynamic_slippage_pct = derive_slippage_tolerance(gross_profit, fee_pct) * DYNAMIC_SLIPPAGE_BUFFER
     dynamic_slippage_bps = int(dynamic_slippage_pct * 100)
 
     # Clamp to sensible range: 50bps minimum, 200bps maximum
@@ -530,9 +609,11 @@ if __name__ == "__main__":
     print(f"  Liquidity safe:         > {LIQUIDITY_RATIO_SIMULATE}x capital")
     print(f"  Jupiter platform fee:   {JUPITER_PLATFORM_FEE_PCT}% per leg")
     print(f"  Solana tx fee:          ${SOLANA_TX_FEE_USD:.4f} per tx")
-    print(f"  Net profit (direct):    > {NET_PROFIT_THRESHOLD_DIRECT}%  [2-leg trades]")
-    print(f"  Net profit (triangular):> {NET_PROFIT_THRESHOLD_TRIANGULAR}%  [3-leg trades]")
-    print(f"  Dynamic slippage:       net% * {DYNAMIC_SLIPPAGE_BUFFER}")
+    print(f"  Desired net profit:     {DESIRED_NET_PROFIT_PCT}%  (anchors slippage formula)")
+    print(f"  Slippage formula:       (Gross - Fees - {DESIRED_NET_PROFIT_PCT}%) / 2")
+    print(f"  Min gross/slip ratio:   {MIN_GROSS_SLIPPAGE_RATIO}:1  (3:1 rule of thumb)")
+    print(f"  Slippage method:        worst-leg (most conservative)")
+    print(f"  Dynamic slippage:       derived_tolerance * {DYNAMIC_SLIPPAGE_BUFFER}")
     print()
 
     # Test case 1 — should PASS execute gate
