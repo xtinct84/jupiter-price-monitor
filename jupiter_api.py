@@ -88,11 +88,9 @@ class JupiterAPI:
                 'price_usd': float(price_info.get('usdPrice', 0)),
                 'timestamp': datetime.now(),
                 'extra_info': {
-                    'vs_token': price_info.get('vsToken', ''),
-                    'vs_token_symbol': price_info.get('vsTokenSymbol', ''),
-                    'provider': price_info.get('provider', ''),
                     'price_change_24h': float(price_info.get('priceChange24h', 0)),
-                    'confidence': float(price_info.get('confidence', 0)),
+                    'liquidity': float(price_info.get('liquidity', 0)),
+                    'created_at': price_info.get('createdAt', ''),
                     'block_id': price_info.get('blockId'),
                     'decimals': price_info.get('decimals')
                 }
@@ -148,15 +146,13 @@ class JupiterAPI:
                             'token_id': token_id,
                             'price_usd': float(price_info['usdPrice']),
                             'timestamp': datetime.now(),
-                            'extra_info': {
-                                'vs_token': price_info.get('vsToken', ''),
-                                'vs_token_symbol': price_info.get('vsTokenSymbol', ''),
-                                'provider': price_info.get('provider', ''),
-                                'price_change_24h': float(price_info.get('priceChange24h', 0)),
-                                'confidence': float(price_info.get('confidence', 0)),
-                                'block_id': price_info.get('blockId'),
-                                'decimals': price_info.get('decimals')
-                            }
+                        'extra_info': {
+                            'price_change_24h': float(price_info.get('priceChange24h', 0)),
+                            'liquidity': float(price_info.get('liquidity', 0)),
+                            'created_at': price_info.get('createdAt', ''),
+                            'block_id': price_info.get('blockId'),
+                            'decimals': price_info.get('decimals')
+                        }
                         }
                         logger.debug(f"Price for {token_id[:8]}: ${price_info['usdPrice']}")
                     else:

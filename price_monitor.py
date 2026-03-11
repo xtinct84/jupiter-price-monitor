@@ -16,17 +16,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class PriceMonitor:
-    """Monitor token prices and quotes from Jupiter API, export to Excel"""
+    """Monitor token prices and quotes from Jupiter API, export to SQLite and Excel"""
     
     def __init__(self, interval_seconds: int = 30):
         self.api = JupiterAPI()
         self.exporter = DataExporter()
         self.interval = interval_seconds
         
-        # Store price history: {token_symbol: [price_data_list]}
+        # Store price history in memory: {token_symbol: [price_data_list]}
         self.price_history = defaultdict(list)
         
-        # Store quote history: {pair_name: [quote_data_list]}
+        # Store quote history in memory: {pair_name: [quote_data_list]}
         self.quote_history = defaultdict(list)
         
         # Get tokens to monitor
@@ -56,18 +56,14 @@ class PriceMonitor:
         print(f"📊 JUPITER PRICE UPDATE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*80)
         
-        # Sort tokens by symbol
         sorted_items = sorted(prices.items(), key=lambda x: self.token_map.get(x[0], x[0]))
         
         for mint, price_data in sorted_items:
             symbol = self.token_map.get(mint, mint[:8])
             price = price_data['price_usd']
-            
-            # Get price change if available
             price_change = price_data.get('extra_info', {}).get('price_change_24h', 0)
             confidence = price_data.get('extra_info', {}).get('confidence', 0)
             
-            # Format price based on magnitude
             if price >= 1000:
                 price_str = f"${price:,.2f}"
             elif price >= 1:
@@ -77,7 +73,6 @@ class PriceMonitor:
             else:
                 price_str = f"${price:.8f}"
             
-            # Format price change with color indicators
             if price_change > 0:
                 change_str = f"📈 +{price_change:.2f}%"
             elif price_change < 0:
@@ -85,7 +80,6 @@ class PriceMonitor:
             else:
                 change_str = f"➡️  {price_change:.2f}%"
             
-            # Display with padding for alignment
             print(f"  {symbol:8s} | {price_str:20s} | 24h: {change_str:15s} | Conf: {confidence:.2f}")
         
         print("="*80)
@@ -100,34 +94,20 @@ class PriceMonitor:
             if not quote_data:
                 continue
             
-            # Parse pair name
             parts = pair_name.split('/')
             if len(parts) == 2:
                 input_symbol, output_symbol = parts
-                
-                # Get token info for decimal conversion
                 input_token = TokenRegistry.get_token(input_symbol)
                 output_token = TokenRegistry.get_token(output_symbol)
                 
                 if input_token and output_token:
-                    # Convert amounts to human-readable
                     in_amount = quote_data['in_amount'] / (10 ** input_token.decimals)
                     out_amount = quote_data['out_amount'] / (10 ** output_token.decimals)
-                    
-                    # Calculate effective price
                     effective_price = out_amount / in_amount if in_amount > 0 else 0
-                    
                     price_impact = quote_data['price_impact_pct']
                     slippage = quote_data['slippage_bps']
-                    
-                    # Determine route complexity
                     route_plan = quote_data.get('route_plan', [])
-                    route_steps = len(route_plan)
-                    
-                    if route_steps == 1:
-                        route_str = "Direct"
-                    else:
-                        route_str = f"{route_steps} hops"
+                    route_str = "Direct" if len(route_plan) == 1 else f"{len(route_plan)} hops"
                     
                     print(f"  {pair_name:12s} | 1 {input_symbol} = {effective_price:.6f} {output_symbol}")
                     print(f"                    | Impact: {price_impact:.3f}% | Slippage: {slippage/100:.2f}% | Route: {route_str}")
@@ -136,7 +116,7 @@ class PriceMonitor:
         print("="*80)
     
     async def fetch_and_store_prices(self):
-        """Fetch prices from Jupiter API and store in history"""
+        """Fetch prices from Jupiter API, store in memory and SQLite"""
         logger.info("Fetching prices from Jupiter API...")
         
         prices = await self.api.get_multiple_prices(self.tokens)
@@ -145,25 +125,28 @@ class PriceMonitor:
             logger.warning("No prices fetched this round")
             return
         
-        # Store in history
+        # Add symbol to each price record and store in memory
+        labeled_prices = {}
         for mint, price_data in prices.items():
             symbol = self.token_map.get(mint, mint[:8])
-            
-            # Add symbol to price data
             price_data['symbol'] = symbol
+            labeled_prices[symbol] = price_data
             
-            # Append to history (limit to last 1000 entries)
+            # Append to in-memory history (limit to last 1000 entries)
             self.price_history[symbol].append(price_data)
             if len(self.price_history[symbol]) > 1000:
                 self.price_history[symbol] = self.price_history[symbol][-1000:]
         
-        # Display update
+        # --- NEW: Write this iteration's prices to SQLite in one transaction ---
+        self.exporter.insert_prices_batch(labeled_prices)
+        
+        # Display update to terminal
         self.display_price_update(prices)
         
-        logger.info(f"✅ Fetched prices for {len(prices)} tokens")
+        logger.info(f"✅ Fetched and stored prices for {len(prices)} tokens")
     
     async def fetch_and_store_quotes(self):
-        """Fetch quotes from Jupiter API and store in history"""
+        """Fetch quotes from Jupiter API, store in memory and SQLite"""
         logger.info("Fetching quotes from Jupiter API...")
         
         quotes = {}
@@ -176,7 +159,6 @@ class PriceMonitor:
                 logger.warning(f"Token not found for pair: {input_symbol}/{output_symbol}")
                 continue
             
-            # Get quote for 1 unit of input token
             amount = 1 * (10 ** input_token.decimals)
             
             quote_data = await self.api.get_quote(
@@ -188,41 +170,41 @@ class PriceMonitor:
             
             if quote_data:
                 pair_name = f"{input_symbol}/{output_symbol}"
-                
-                # Add pair name and symbols
                 quote_data['pair'] = pair_name
                 quote_data['input_symbol'] = input_symbol
                 quote_data['output_symbol'] = output_symbol
                 
-                # Store in history (limit to last 1000 entries)
+                # Append to in-memory history
                 self.quote_history[pair_name].append(quote_data)
                 if len(self.quote_history[pair_name]) > 1000:
                     self.quote_history[pair_name] = self.quote_history[pair_name][-1000:]
                 
                 quotes[pair_name] = quote_data
+                
+                # --- NEW: Write each quote to SQLite immediately ---
+                self.exporter.insert_quote(quote_data)
+                
                 logger.debug(f"Got quote for {pair_name}: {quote_data['out_amount'] / (10 ** output_token.decimals):.6f}")
             else:
                 logger.warning(f"Failed to get quote for {input_symbol}/{output_symbol}")
             
-            # Small delay to avoid rate limiting
             await asyncio.sleep(0.3)
         
-        # Display update
         if quotes:
             self.display_quote_update(quotes)
-            logger.info(f"✅ Fetched quotes for {len(quotes)} pairs")
+            logger.info(f"✅ Fetched and stored quotes for {len(quotes)} pairs")
         else:
             logger.warning("No quotes fetched this round")
     
     async def run(self, duration_minutes: int = 60):
         """
-        Run the price and quote monitor
-        
+        Run the price and quote monitor.
+
         Args:
-            duration_minutes: How long to run (in minutes). Use 0 for infinite.
+            duration_minutes: How long to run in minutes. Use 0 for infinite.
         """
         logger.info(f"🚀 Starting Jupiter Price & Quote Monitor...")
-        logger.info(f"   Using Jupiter API v3 for prices, v1 for quotes")
+        logger.info(f"   Prices and quotes will be written to SQLite in real time")
         
         if duration_minutes > 0:
             logger.info(f"   Will run for {duration_minutes} minutes")
@@ -241,13 +223,15 @@ class PriceMonitor:
                 print(f"Iteration {iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 print(f"{'='*60}")
                 
-                # Fetch and store prices
                 await self.fetch_and_store_prices()
-                
-                # Fetch and store quotes
                 await self.fetch_and_store_quotes()
                 
-                # Wait before next iteration
+                # Print database stats every 10 iterations
+                if iteration % 10 == 0:
+                    stats = self.exporter.get_database_stats()
+                    logger.info(f"📦 DB Stats: {stats.get('total_price_records', 0)} price records | "
+                                f"{stats.get('total_quote_records', 0)} quote records")
+                
                 if iteration < total_iterations:
                     logger.info(f"⏳ Waiting {self.interval} seconds until next check...")
                     await asyncio.sleep(self.interval)
@@ -259,22 +243,16 @@ class PriceMonitor:
             logger.error(f"\n❌ Error in monitoring loop: {e}")
         
         finally:
-            # Export all data to Excel using consolidated approach
-            logger.info("\n📤 Exporting consolidated data to Excel...")
-    
-            # Export consolidated price history (one file with multiple sheets)
+            logger.info("\n📤 Exporting session data to Excel...")
             self.exporter.export_consolidated_price_history()
-    
-            # Export consolidated quote history
             self.exporter.export_consolidated_quotes(self.quote_history)
-    
-            # Export daily summary
             self.exporter.export_combined_report(self.price_history)
-    
-            # Cleanup
+            
             await self.api.close()
             
-            # Display summary
+            # Final database summary
+            stats = self.exporter.get_database_stats()
+            
             total_price_points = sum(len(h) for h in self.price_history.values())
             total_quote_points = sum(len(h) for h in self.quote_history.values())
             
@@ -282,6 +260,9 @@ class PriceMonitor:
             logger.info(f"   Total iterations: {iteration}")
             logger.info(f"   Tokens monitored: {len(self.price_history)}")
             logger.info(f"   Pairs monitored: {len(self.quote_history)}")
-            logger.info(f"   Price data points: {total_price_points}")
-            logger.info(f"   Quote data points: {total_quote_points}")
+            logger.info(f"   Price data points this session: {total_price_points}")
+            logger.info(f"   Quote data points this session: {total_quote_points}")
+            logger.info(f"   Total DB price records (all sessions): {stats.get('total_price_records', 0)}")
+            logger.info(f"   Total DB quote records (all sessions): {stats.get('total_quote_records', 0)}")
+            logger.info(f"   Database location: {self.exporter.db_path}")
             logger.info(f"   Excel files saved to: {self.exporter.output_dir}")
