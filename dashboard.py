@@ -144,6 +144,49 @@ def get_all_pairs(conn) -> list:
     except Exception:
         return []
 
+
+def get_recent_signals(conn, limit: int = 50) -> pd.DataFrame:
+    """Fetch the most recent signals from the signals table"""
+    query = """
+        SELECT timestamp, signal_type, pair, estimated_profit_pct,
+               weighted_score, execute_candidate, description,
+               condition_breakdown, resolved
+        FROM signals
+        ORDER BY timestamp DESC
+        LIMIT ?
+    """
+    try:
+        df = pd.read_sql_query(query, conn, params=(limit,))
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_signal_stats(conn) -> dict:
+    """Return summary statistics from the signals table"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM signals")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM signals WHERE execute_candidate = 1")
+        execute_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM signals WHERE execute_candidate = 0")
+        analysis_count = cursor.fetchone()[0]
+        cursor.execute("SELECT MAX(estimated_profit_pct) FROM signals")
+        max_profit = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT MAX(timestamp) FROM signals")
+        last_signal = cursor.fetchone()[0]
+        return {
+            'total': total,
+            'execute_candidates': execute_count,
+            'needs_analysis': analysis_count,
+            'max_profit_pct': max_profit,
+            'last_signal': last_signal
+        }
+    except Exception:
+        return {}
+
 # ─────────────────────────────────────────────
 # FORMATTING HELPERS
 # ─────────────────────────────────────────────
@@ -391,6 +434,161 @@ else:
                     f"Effective rate: 1 {in_sym} → {out_sym} | "
                     f"{len(quote_hist_df)} data points over last {hours_filter} hours"
                 )
+
+st.markdown("---")
+
+# ─────────────────────────────────────────────
+# SECTION 6 — SIGNALS PANEL
+# ─────────────────────────────────────────────
+
+st.subheader("📡 Arbitrage Signals")
+
+# Check if signals table exists
+try:
+    signal_stats = get_signal_stats(conn)
+    signals_available = True
+except Exception:
+    signals_available = False
+
+if not signals_available:
+    st.info("Signals table not found. Run arbitrage_detector.py to initialize.")
+else:
+    # Signal summary metrics
+    s_col1, s_col2, s_col3, s_col4 = st.columns(4)
+    s_col1.metric("📡 Total Signals",      f"{signal_stats.get('total', 0):,}")
+    s_col2.metric("🟢 Execute Candidates", f"{signal_stats.get('execute_candidates', 0):,}")
+    s_col3.metric("🟡 Needs Analysis",     f"{signal_stats.get('needs_analysis', 0):,}")
+    s_col4.metric("📈 Best Profit",        f"{signal_stats.get('max_profit_pct', 0):.4f}%")
+
+    st.markdown("")
+
+    # Filters row
+    filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 2])
+
+    with filter_col1:
+        signal_filter = st.selectbox(
+            "Filter by Classification",
+            options=["All", "Execute Candidates", "Needs Analysis"],
+            index=0
+        )
+
+    with filter_col2:
+        type_filter = st.selectbox(
+            "Filter by Type",
+            options=["All", "rate_divergence", "triangular_arbitrage", "impact_anomaly"],
+            index=0
+        )
+
+    with filter_col3:
+        signal_limit = st.slider(
+            "Number of signals to display",
+            min_value=10,
+            max_value=200,
+            value=50,
+            step=10
+        )
+
+    # Fetch signals
+    signals_df = get_recent_signals(conn, limit=signal_limit)
+
+    if signals_df.empty:
+        st.warning("No signals detected yet. Run arbitrage_detector.py to begin detection.")
+    else:
+        # Apply filters
+        if signal_filter == "Execute Candidates":
+            signals_df = signals_df[signals_df['execute_candidate'] == 1]
+        elif signal_filter == "Needs Analysis":
+            signals_df = signals_df[signals_df['execute_candidate'] == 0]
+
+        if type_filter != "All":
+            signals_df = signals_df[signals_df['signal_type'] == type_filter]
+
+        if signals_df.empty:
+            st.info("No signals match the selected filters.")
+        else:
+            # Format for display
+            display_signals = signals_df.copy()
+
+            display_signals['Classification'] = display_signals['execute_candidate'].apply(
+                lambda x: "🟢 Execute" if x == 1 else "🟡 Analysis"
+            )
+            display_signals['Signal Type'] = display_signals['signal_type'].apply(
+                lambda x: x.replace('_', ' ').title()
+            )
+            display_signals['Est. Profit'] = display_signals['estimated_profit_pct'].apply(
+                lambda x: f"{x:.4f}%"
+            )
+            display_signals['Score'] = display_signals['weighted_score'].apply(
+                lambda x: f"{x}/100"
+            )
+            display_signals['Time'] = display_signals['timestamp'].apply(
+                lambda x: x.strftime('%Y-%m-%d %H:%M:%S')
+            )
+
+            display_signals = display_signals[[
+                'Time', 'Classification', 'Signal Type',
+                'pair', 'Est. Profit', 'Score'
+            ]]
+            display_signals.columns = [
+                'Time', 'Classification', 'Type',
+                'Pair', 'Est. Profit', 'Score'
+            ]
+
+            st.dataframe(
+                display_signals,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.caption(f"Showing {len(display_signals)} signals")
+
+            # Signal detail expander
+            st.markdown("")
+            with st.expander("🔍 View Signal Details"):
+                if not signals_df.empty:
+                    selected_idx = st.selectbox(
+                        "Select signal to inspect",
+                        options=range(len(signals_df)),
+                        format_func=lambda i: (
+                            f"{signals_df.iloc[i]['timestamp'].strftime('%H:%M:%S')} | "
+                            f"{signals_df.iloc[i]['pair']} | "
+                            f"Score: {signals_df.iloc[i]['weighted_score']}"
+                        )
+                    )
+                    selected_signal = signals_df.iloc[selected_idx]
+
+                    detail_col1, detail_col2 = st.columns(2)
+                    with detail_col1:
+                        st.markdown(f"**Pair:** {selected_signal['pair']}")
+                        st.markdown(f"**Type:** {selected_signal['signal_type'].replace('_', ' ').title()}")
+                        st.markdown(f"**Score:** {selected_signal['weighted_score']}/100")
+                        st.markdown(f"**Est. Profit:** {selected_signal['estimated_profit_pct']:.4f}%")
+                        st.markdown(f"**Time:** {selected_signal['timestamp']}")
+
+                    with detail_col2:
+                        st.markdown("**Description:**")
+                        st.info(selected_signal['description'])
+
+                    st.markdown("**Condition Breakdown:**")
+                    breakdown_items = selected_signal['condition_breakdown'].split(' | ')
+                    for item in breakdown_items:
+                        if item.startswith('✓'):
+                            st.success(item)
+                        else:
+                            st.error(item)
+
+    # Signal score history chart
+    st.markdown("")
+    st.markdown("**Signal Score History**")
+    all_signals_df = get_recent_signals(conn, limit=200)
+    if not all_signals_df.empty:
+        chart_df = all_signals_df[['timestamp', 'weighted_score', 'signal_type']].copy()
+        chart_df = chart_df.sort_values('timestamp')
+        st.line_chart(
+            chart_df.set_index('timestamp')['weighted_score'],
+            use_container_width=True
+        )
+        st.caption("Weighted score trend across all recent signals")
 
 # ─────────────────────────────────────────────
 # AUTO REFRESH
