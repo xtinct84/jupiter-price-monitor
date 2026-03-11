@@ -23,12 +23,19 @@ import os
 import logging
 import httpx
 import numpy as np
+from decimal import Decimal, getcontext
+getcontext().prec = 28
 import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
+from execution_validator import enrich_signal_with_validation
 
 load_dotenv()
+
+# In-memory duplicate cache — primary gate within a session
+# key = (pair, signal_type), value = datetime fired
+_signal_cache: dict = {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,11 +67,14 @@ WEIGHTS = {
 }
 
 # --- Condition pass thresholds ---
-MIN_PROFIT_PCT        = 0.05     # Minimum estimated profit % (filters below 0.049%)
+# Strategy-specific profit thresholds (MEV-adjusted)
+MIN_PROFIT_RATE_DIVERGENCE  = 1.0   # Direct 2-step trades — highest MEV risk
+MIN_PROFIT_TRIANGULAR       = 0.6   # Multi-hop paths — lower MEV exposure
+MIN_PROFIT_IMPACT_ANOMALY   = 1.0   # Liquidity shift signals — same MEV risk as direct
 MAX_PRICE_IMPACT_PCT  = 1.0      # Maximum acceptable price impact %
 MIN_LIQUIDITY_USD     = 500_000  # Minimum liquidity in USD
-MAX_SLIPPAGE_PCT      = 1.0      # Maximum acceptable slippage %
-DUPLICATE_WINDOW_MIN  = 5        # Minutes before same signal can re-fire
+MAX_SLIPPAGE_PCT      = 1.5      # Balanced MEV sweet spot (1.0% too tight, 2.0% sandwich risk)
+DUPLICATE_WINDOW_MIN  = 15       # Conservative window — stricter thresholds reduce noise naturally
 DIVERGENCE_SIGMA      = 2.0      # Standard deviations from rolling mean
 ROLLING_WINDOW        = 20       # Number of recent quotes for rolling stats
 
@@ -195,9 +205,26 @@ def get_latest_price(conn, symbol: str) -> dict:
 
 
 def check_duplicate_signal(conn, pair: str, signal_type: str) -> bool:
-    """Return True if an identical signal fired within the duplicate window"""
-    window_start = (datetime.now() - timedelta(minutes=DUPLICATE_WINDOW_MIN)
-                    ).strftime('%Y-%m-%d %H:%M:%S')
+    """
+    Return True if identical signal fired within duplicate window.
+    Uses in-memory cache as primary gate (within-session)
+    and DB as secondary gate (cross-session).
+    """
+    key = (pair, signal_type)
+    now = datetime.now()
+    window = timedelta(minutes=DUPLICATE_WINDOW_MIN)
+
+    # Primary: in-memory cache
+    if key in _signal_cache:
+        age = (now - _signal_cache[key]).total_seconds()
+        if now - _signal_cache[key] < window:
+            logger.info(f"🔇 Suppressed duplicate: {pair} ({signal_type}) — {age:.0f}s ago")
+            return True
+        else:
+            del _signal_cache[key]
+
+    # Secondary: database for cross-session duplicates
+    window_start = (now - window).strftime('%Y-%m-%d %H:%M:%S')
     query = """
         SELECT COUNT(*) FROM signals
         WHERE pair = ?
@@ -214,8 +241,14 @@ def check_duplicate_signal(conn, pair: str, signal_type: str) -> bool:
         return False
 
 
+def register_signal_in_cache(pair: str, signal_type: str):
+    """Register a signal in cache immediately after detection."""
+    _signal_cache[(pair, signal_type)] = datetime.now()
+
+
 def log_signal(conn, signal: dict):
-    """Insert a detected signal into the signals table"""
+    """Insert a detected signal into the signals table and update cache"""
+    register_signal_in_cache(signal['pair'], signal['signal_type'])
     try:
         conn.execute("""
             INSERT INTO signals (
@@ -230,7 +263,7 @@ def log_signal(conn, signal: dict):
             signal['description'],
             signal['estimated_profit_pct'],
             signal['weighted_score'],
-            1 if signal['weighted_score'] >= EXECUTE_THRESHOLD else 0,
+            1 if signal.get('execute_candidate', False) else 0,
             signal['condition_breakdown']
         ))
         conn.commit()
@@ -246,20 +279,27 @@ def log_signal(conn, signal: dict):
 
 def calculate_effective_rate(in_amount: int, out_amount: int,
                               in_symbol: str, out_symbol: str) -> float:
-    """Convert raw amounts to effective swap rate"""
+    """
+    Convert raw amounts to effective swap rate using high-precision
+    Decimal arithmetic to prevent float truncation on small-value
+    tokens like BONK (5 decimals, very small per-unit value).
+    """
     try:
         in_dec  = TOKEN_DECIMALS.get(in_symbol, 6)
         out_dec = TOKEN_DECIMALS.get(out_symbol, 6)
-        in_amt  = in_amount  / (10 ** in_dec)
-        out_amt = out_amount / (10 ** out_dec)
-        return out_amt / in_amt if in_amt > 0 else 0.0
+        in_amt  = Decimal(in_amount)  / Decimal(10 ** in_dec)
+        out_amt = Decimal(out_amount) / Decimal(10 ** out_dec)
+        if in_amt == 0:
+            return 0.0
+        return float(out_amt / in_amt)
     except Exception:
         return 0.0
 
 
 def score_conditions(quote: dict, price_data: dict,
                      recent_quotes: pd.DataFrame,
-                     conn, signal_type: str) -> dict:
+                     conn, signal_type: str,
+                     min_profit_pct: float = 1.0) -> dict:
     """
     Evaluate each condition and return weighted score breakdown.
 
@@ -282,9 +322,12 @@ def score_conditions(quote: dict, price_data: dict,
     if not recent_quotes.empty and len(recent_quotes) >= 3:
         in_dec  = TOKEN_DECIMALS.get(in_sym, 6)
         out_dec = TOKEN_DECIMALS.get(out_sym, 6)
-        recent_quotes['rate'] = (
-            (recent_quotes['out_amount'] / (10 ** out_dec)) /
-            (recent_quotes['in_amount']  / (10 ** in_dec))
+        recent_quotes['rate'] = recent_quotes.apply(
+            lambda row: float(
+                Decimal(int(row['out_amount'])) / Decimal(10 ** out_dec) /
+                (Decimal(int(row['in_amount'])) / Decimal(10 ** in_dec))
+            ) if row['in_amount'] > 0 else 0.0,
+            axis=1
         )
         current_rate = calculate_effective_rate(
             quote['in_amount'], quote['out_amount'], in_sym, out_sym
@@ -293,7 +336,7 @@ def score_conditions(quote: dict, price_data: dict,
         if mean_rate > 0:
             estimated_profit_pct = ((current_rate - mean_rate) / mean_rate) * 100
 
-    passed_profit = estimated_profit_pct >= MIN_PROFIT_PCT
+    passed_profit = estimated_profit_pct >= min_profit_pct
     points = WEIGHTS['profit'] if passed_profit else 0
     total_score += points
     breakdown['profit'] = {
@@ -301,7 +344,7 @@ def score_conditions(quote: dict, price_data: dict,
         'max': WEIGHTS['profit'],
         'passed': passed_profit,
         'value': f"{estimated_profit_pct:.4f}%",
-        'threshold': f">= {MIN_PROFIT_PCT}%"
+        'threshold': f">= {min_profit_pct}%"
     }
 
     # --- 2. PRICE IMPACT CONDITION ---
@@ -423,6 +466,12 @@ def detect_rate_divergence(conn) -> list:
 
     for in_sym, out_sym in monitored_pairs:
         pair = f"{in_sym}/{out_sym}"
+
+        # Pre-flight duplicate check — skip scoring entirely if suppressed
+        if check_duplicate_signal(conn, pair, 'rate_divergence'):
+            logger.info(f"🔇 Skipping {pair} rate_divergence — duplicate within {DUPLICATE_WINDOW_MIN} min")
+            continue
+
         quote = get_latest_quote(conn, pair)
         if not quote:
             continue
@@ -434,9 +483,15 @@ def detect_rate_divergence(conn) -> list:
             continue
 
         score_result = score_conditions(
-            quote, price_data, recent_quotes, conn, 'rate_divergence'
+            quote, price_data, recent_quotes, conn, 'rate_divergence',
+            min_profit_pct=MIN_PROFIT_RATE_DIVERGENCE
         )
         total_score = score_result['total_score']
+
+        # Discard negative profit signals — market has moved against the opportunity
+        if score_result['estimated_profit_pct'] <= 0:
+            logger.debug(f"Discarding {pair} rate_divergence — negative profit {score_result['estimated_profit_pct']:.4f}%")
+            continue
 
         if total_score >= ANALYSIS_THRESHOLD:
             breakdown_str = format_condition_breakdown(score_result['breakdown'])
@@ -471,6 +526,12 @@ def detect_triangular_arbitrage(conn) -> list:
         pair_ab = f"{token_a}/{token_b}"
         pair_bc = f"{token_b}/{token_c}"
         pair_ca = f"{token_c}/{token_a}"
+        path_label = f"{token_a}->{token_b}->{token_c}->{token_a}"
+
+        # Pre-flight duplicate check
+        if check_duplicate_signal(conn, path_label, 'triangular_arbitrage'):
+            logger.info(f"🔇 Skipping {path_label} triangular — duplicate within {DUPLICATE_WINDOW_MIN} min")
+            continue
 
         quote_ab = get_latest_quote(conn, pair_ab)
         quote_bc = get_latest_quote(conn, pair_bc)
@@ -511,7 +572,8 @@ def detect_triangular_arbitrage(conn) -> list:
 
         score_result = score_conditions(
             quote_ab, price_data, recent_quotes,
-            conn, 'triangular_arbitrage'
+            conn, 'triangular_arbitrage',
+            min_profit_pct=MIN_PROFIT_TRIANGULAR
         )
 
         # Override profit score with actual triangular calculation
@@ -555,6 +617,12 @@ def detect_impact_anomaly(conn) -> list:
 
     for in_sym, out_sym in monitored_pairs:
         pair = f"{in_sym}/{out_sym}"
+
+        # Pre-flight duplicate check
+        if check_duplicate_signal(conn, pair, 'impact_anomaly'):
+            logger.info(f"🔇 Skipping {pair} impact_anomaly — duplicate within {DUPLICATE_WINDOW_MIN} min")
+            continue
+
         recent_quotes = get_recent_quotes(conn, pair)
 
         if recent_quotes.empty or len(recent_quotes) < 3:
@@ -579,9 +647,15 @@ def detect_impact_anomaly(conn) -> list:
             continue
 
         score_result = score_conditions(
-            quote, price_data, recent_quotes, conn, 'impact_anomaly'
+            quote, price_data, recent_quotes, conn, 'impact_anomaly',
+            min_profit_pct=MIN_PROFIT_IMPACT_ANOMALY
         )
         total_score = score_result['total_score']
+
+        # Discard negative profit signals
+        if score_result['estimated_profit_pct'] <= 0:
+            logger.debug(f"Discarding {pair} impact_anomaly — negative profit {score_result['estimated_profit_pct']:.4f}%")
+            continue
 
         if total_score >= ANALYSIS_THRESHOLD:
             breakdown_str = format_condition_breakdown(score_result['breakdown'])
@@ -647,7 +721,15 @@ async def send_telegram_alert(signal: dict):
     for item in breakdown_items:
         message += f"  {item}\n"
 
-    if score >= EXECUTE_THRESHOLD:
+    # Append validation result if present
+    validation = signal.get('validation')
+    if validation:
+        message += f"\n{divider}\n"
+        message += "EXECUTION VALIDATION:\n"
+        for line in validation.detail_lines():
+            message += f"  {line}\n"
+
+    if score >= EXECUTE_THRESHOLD and signal.get('execute_candidate'):
         message += f"\n{divider}\n"
         message += "MANUAL REVIEW REQUIRED before execution.\n"
         message += "OpenClaw agent not yet connected.\n"
@@ -669,6 +751,40 @@ async def send_telegram_alert(signal: dict):
 # =============================================================================
 # MAIN DETECTION RUNNER
 # =============================================================================
+
+def _get_quote_legs_for_signal(conn, signal: dict) -> list:
+    """
+    Fetch the most recent quote leg(s) for a signal's pair(s).
+    For triangular signals, fetches each leg in the path.
+    For direct signals, fetches the single pair.
+    """
+    signal_type = signal.get('signal_type', '')
+    pair = signal.get('pair', '')
+    legs = []
+
+    try:
+        if 'triangular' in signal_type:
+            # Parse path: TOKEN_A->TOKEN_B->TOKEN_C->TOKEN_A
+            tokens = pair.replace('->', '/').split('/')
+            if len(tokens) >= 3:
+                leg_pairs = [
+                    f'{tokens[0]}/{tokens[1]}',
+                    f'{tokens[1]}/{tokens[2]}',
+                ]
+                for leg_pair in leg_pairs:
+                    q = get_latest_quote(conn, leg_pair)
+                    if q:
+                        legs.append(q)
+        else:
+            # Direct pair
+            q = get_latest_quote(conn, pair)
+            if q:
+                legs.append(q)
+    except Exception as e:
+        logger.error(f'Error fetching quote legs for {pair}: {e}')
+
+    return legs
+
 
 async def run_detection():
     """
@@ -696,8 +812,14 @@ async def run_detection():
         conn.close()
         return
 
-    # Log and alert
+    # Validate, log and alert
     for signal in all_signals:
+        # Build quote_legs list from DB for this signal
+        quote_legs = _get_quote_legs_for_signal(conn, signal)
+
+        # Run 5-stage validation pipeline
+        signal = enrich_signal_with_validation(signal, quote_legs)
+
         log_signal(conn, signal)
         await send_telegram_alert(signal)
 
@@ -724,14 +846,17 @@ if __name__ == "__main__":
     ║         Weighted Scoring System v1.0                        ║
     ╚══════════════════════════════════════════════════════════════╝
     """)
-    print(f"  Execute threshold:  {EXECUTE_THRESHOLD}/100 pts")
-    print(f"  Analysis threshold: {ANALYSIS_THRESHOLD}/100 pts")
-    print(f"  Min profit:         {MIN_PROFIT_PCT}%")
-    print(f"  Max price impact:   {MAX_PRICE_IMPACT_PCT}%")
-    print(f"  Min liquidity:      ${MIN_LIQUIDITY_USD:,}")
-    print(f"  Duplicate window:   {DUPLICATE_WINDOW_MIN} minutes")
-    print(f"  Divergence sigma:   {DIVERGENCE_SIGMA}σ")
-    print(f"  Rolling window:     {ROLLING_WINDOW} quotes")
+    print(f"  Execute threshold:       {EXECUTE_THRESHOLD}/100 pts")
+    print(f"  Analysis threshold:      {ANALYSIS_THRESHOLD}/100 pts")
+    print(f"  Min profit (divergence): {MIN_PROFIT_RATE_DIVERGENCE}%  [MEV buffer: direct 2-step]")
+    print(f"  Min profit (triangular): {MIN_PROFIT_TRIANGULAR}%   [MEV buffer: multi-hop]")
+    print(f"  Min profit (impact):     {MIN_PROFIT_IMPACT_ANOMALY}%  [MEV buffer: liquidity shift]")
+    print(f"  Max slippage:            {MAX_SLIPPAGE_PCT}%  [MEV sweet spot]")
+    print(f"  Max price impact:        {MAX_PRICE_IMPACT_PCT}%")
+    print(f"  Min liquidity:           ${MIN_LIQUIDITY_USD:,}")
+    print(f"  Duplicate window:        {DUPLICATE_WINDOW_MIN} minutes")
+    print(f"  Divergence sigma:        {DIVERGENCE_SIGMA}σ")
+    print(f"  Rolling window:          {ROLLING_WINDOW} quotes")
     print()
 
     telegram_status = "✅ Configured" if TELEGRAM_BOT_TOKEN else "⚠️  Not configured"
