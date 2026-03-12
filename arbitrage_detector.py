@@ -114,6 +114,9 @@ TRIANGULAR_PATHS = [
     ('JUP',  'USDC', 'SOL'),
     ('BONK', 'SOL',  'USDC'),
     ('WIF',  'SOL',  'USDC'),
+    # Added: additional liquid paths
+    ('SOL',  'USDT', 'JUP'),   # SOL→USDT→JUP→SOL
+    ('JUP',  'SOL',  'USDC'),  # JUP→SOL→USDC→JUP
 ]
 
 # Token decimals for amount conversion
@@ -518,7 +521,9 @@ def score_conditions(quote: dict, price_data: dict,
     return {
         'total_score': total_score,
         'breakdown': breakdown,
-        'estimated_profit_pct': estimated_profit_pct
+        'estimated_profit_pct': estimated_profit_pct,
+        'detected_rate': current_rate,
+        'mean_rate': mean_rate,
     }
 
 
@@ -596,7 +601,10 @@ def detect_rate_divergence(conn) -> list:
                 ),
                 'estimated_profit_pct': score_result['estimated_profit_pct'],
                 'weighted_score': total_score,
-                'condition_breakdown': breakdown_str
+                'condition_breakdown': breakdown_str,
+                'detected_rate': score_result.get('detected_rate', 0.0),
+                'input_symbol': in_sym,
+                'output_symbol': out_sym,
             }
             signals.append(signal)
             logger.info(f"📡 Rate divergence signal: {pair} | Score: {total_score}")
@@ -770,7 +778,10 @@ def detect_impact_anomaly(conn) -> list:
                 ),
                 'estimated_profit_pct': score_result['estimated_profit_pct'],
                 'weighted_score': total_score,
-                'condition_breakdown': breakdown_str
+                'condition_breakdown': breakdown_str,
+                'detected_rate': score_result.get('detected_rate', 0.0),
+                'input_symbol': in_sym,
+                'output_symbol': out_sym,
             }
             signals.append(signal)
             logger.info(f"📡 Impact anomaly: {pair} | {sigma:.2f}σ | Score: {total_score}")
@@ -979,6 +990,9 @@ def detect_momentum_breakout(conn) -> list:
                     'z_score':              round(z_score, 4),
                     'trend_direction':      trend_direction,
                     'impact_z':             round(impact_z, 4),
+                    'detected_rate':        round(current_rate, 8),
+                    'input_symbol':         in_sym,
+                    'output_symbol':        out_sym,
                 }
                 logger.info(
                     f"📈 Momentum breakout: {pair} | "

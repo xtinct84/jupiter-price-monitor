@@ -121,11 +121,14 @@ class ValidationResult:
     slippage_pct:           float = 0.0
     net_profit_pct:         float = 0.0
 
+    # Stage 0
+    price_drift_pct:        float = 0.0     # Rate drift since signal detection
+
     # Stage 5
     execute_gate_passed:    bool  = False
     dynamic_slippage_bps:   int   = 0       # Recommended slippage in basis points
     multiplier_tier:        str   = ""      # Liquidity depth tier label
-    recommendation:         str   = ""      # EXECUTE / ANALYSIS / REJECT
+    recommendation:         str   = ""      # EXECUTE / ANALYSIS / REJECT / STALE
 
     def summary(self) -> str:
         """One-line summary for Telegram alert"""
@@ -143,6 +146,7 @@ class ValidationResult:
         """Full breakdown lines for Telegram"""
         lines = [
             f"Capital         : ${self.capital_usd:.2f}",
+            f"Price drift     : {self.price_drift_pct:.4f}% since detection",
             f"Gross profit    : {self.gross_profit_pct:.4f}%",
             f"Implied depth   : ${self.implied_depth_usd:,.0f} "
             f"({self.liquidity_ratio:.1f}x capital) [{self.liquidity_tier}]",
