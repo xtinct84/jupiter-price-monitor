@@ -38,13 +38,20 @@ async def main():
     
     # Configuration
     interval = int(os.getenv('MONITOR_INTERVAL_SECONDS', 30))
-    duration = int(os.getenv('MONITOR_DURATION_MINUTES', 60))
-    
+
+    # Duration: None = run indefinitely until Ctrl+C
+    # Set MONITOR_DURATION_MINUTES in .env only if you want a fixed stop time
+    duration_env = os.getenv('MONITOR_DURATION_MINUTES')
+    duration = int(duration_env) if duration_env else None
+
     # Display configuration
     print(f"⚙️  Configuration:")
-    print(f"   Check interval: {interval} seconds")
-    print(f"   Duration: {duration} minutes")
-    print(f"   Output folder: price_history/")
+    print(f"   Check interval:  {interval} seconds")
+    if duration:
+        print(f"   Duration:        {duration} minutes (set in .env)")
+    else:
+        print(f"   Duration:        indefinite — stop with Ctrl+C")
+    print(f"   Output folder:   price_history/")
     print()
     
     # Display monitored tokens
@@ -78,7 +85,8 @@ async def main():
     
     # Create and run monitor
     monitor = PriceMonitor(interval_seconds=interval)
-    await monitor.run(duration_minutes=duration)
+    # duration=0 runs indefinitely — price_monitor.run() treats 0 as infinite
+    await monitor.run(duration_minutes=duration if duration else 0)
     
     print("\n" + "="*80)
     print("✅ Monitoring Complete!")
