@@ -71,12 +71,25 @@ WEIGHTS = {
 MIN_PROFIT_RATE_DIVERGENCE  = 1.0   # Direct 2-step trades — highest MEV risk
 MIN_PROFIT_TRIANGULAR       = 0.6   # Multi-hop paths — lower MEV exposure
 MIN_PROFIT_IMPACT_ANOMALY   = 1.0   # Liquidity shift signals — same MEV risk as direct
+MIN_PROFIT_MOMENTUM         = 1.5   # Momentum breakout — strictest, fast reversal risk
 MAX_PRICE_IMPACT_PCT  = 1.0      # Maximum acceptable price impact %
 MIN_LIQUIDITY_USD     = 500_000  # Minimum liquidity in USD
 MAX_SLIPPAGE_PCT      = 1.5      # Balanced MEV sweet spot (1.0% too tight, 2.0% sandwich risk)
 DUPLICATE_WINDOW_MIN  = 15       # Conservative window — stricter thresholds reduce noise naturally
 DIVERGENCE_SIGMA      = 2.0      # Standard deviations from rolling mean
 ROLLING_WINDOW        = 20       # Number of recent quotes for rolling stats
+
+# --- Momentum breakout configuration ---
+MOMENTUM_SIGMA        = 1.5      # sigma threshold for momentum divergence
+MOMENTUM_WINDOW       = 5        # Consecutive quotes for trend confirmation (~2.5 min)
+MOMENTUM_IMPACT_SIGMA = 1.0      # sigma above mean price_impact for volume spike
+
+MOMENTUM_PAIRS = [
+    ('SOL',  'USDC'),
+    ('JUP',  'USDC'),
+    ('JTO',  'USDC'),
+    ('PYTH', 'USDC'),
+]
 
 # --- Telegram configuration ---
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
@@ -752,6 +765,135 @@ async def send_telegram_alert(signal: dict):
 # MAIN DETECTION RUNNER
 # =============================================================================
 
+def detect_momentum_breakout(conn) -> list:
+    """
+    Detect momentum breakout signals on liquid pairs.
+
+    Three conditions ALL required:
+      1. Rate divergence > 1.5σ from rolling mean
+      2. Price trend direction stable across last 5 quotes
+         (monotonically increasing or decreasing — no reversals)
+      3. Volume/liquidity spike: price_impact > rolling mean + 1.0σ
+         (proxy for large order flow since Jupiter omits volume)
+
+    Pairs monitored: SOL/USDC, JUP/USDC, JTO/USDC, PYTH/USDC
+    Min gross profit: 1.5% (momentum reverses fast)
+    """
+    signals = []
+
+    for in_sym, out_sym in MOMENTUM_PAIRS:
+        pair = f"{in_sym}/{out_sym}"
+
+        # Pre-flight duplicate check
+        if check_duplicate_signal(conn, pair, 'momentum_breakout'):
+            logger.info(f"🔇 Skipping {pair} momentum_breakout — duplicate within {DUPLICATE_WINDOW_MIN} min")
+            continue
+
+        # Fetch last MOMENTUM_WINDOW + extra quotes for rolling stats
+        recent_quotes = get_recent_quotes(conn, pair, limit=ROLLING_WINDOW)
+        if recent_quotes.empty or len(recent_quotes) < MOMENTUM_WINDOW + 3:
+            continue
+
+        latest_quote = get_latest_quote(conn, pair)
+        if not latest_quote:
+            continue
+
+        price_data = get_latest_price(conn, in_sym)
+
+        try:
+            rates = recent_quotes['rate'].astype(float)
+            impacts = recent_quotes['price_impact_pct'].astype(float)
+
+            # ── Condition 1: Rate divergence > MOMENTUM_SIGMA ──
+            rate_mean = rates.mean()
+            rate_std  = rates.std()
+            if rate_std == 0:
+                continue
+
+            current_rate = float(rates.iloc[-1])
+            z_score = (current_rate - rate_mean) / rate_std
+
+            if abs(z_score) < MOMENTUM_SIGMA:
+                continue
+
+            # ── Condition 2: Trend direction stable (no reversals) ──
+            window_rates = rates.iloc[-MOMENTUM_WINDOW:].values
+            diffs = [window_rates[i+1] - window_rates[i]
+                     for i in range(len(window_rates) - 1)]
+
+            # All diffs same sign = monotonic trend
+            all_up   = all(d > 0 for d in diffs)
+            all_down = all(d < 0 for d in diffs)
+            trend_stable = all_up or all_down
+
+            if not trend_stable:
+                continue
+
+            trend_direction = 'UP' if all_up else 'DOWN'
+
+            # ── Condition 3: Volume/liquidity spike ──
+            impact_mean = impacts.mean()
+            impact_std  = impacts.std()
+            current_impact = abs(float(latest_quote.get('price_impact_pct', 0)))
+
+            if impact_std > 0:
+                impact_z = (current_impact - impact_mean) / impact_std
+                volume_spike = impact_z >= MOMENTUM_IMPACT_SIGMA
+            else:
+                # Zero std means flat impact — no spike detectable
+                volume_spike = False
+
+            if not volume_spike:
+                continue
+
+            # ── All 3 conditions passed — score the signal ──
+            score_result = score_conditions(
+                latest_quote, price_data, recent_quotes,
+                conn, 'momentum_breakout',
+                min_profit_pct=MIN_PROFIT_MOMENTUM
+            )
+            total_score = score_result['total_score']
+
+            # Discard negative profit
+            if score_result['estimated_profit_pct'] <= 0:
+                continue
+
+            if total_score >= ANALYSIS_THRESHOLD:
+                estimated_profit = score_result['estimated_profit_pct']
+                description = (
+                    f"{pair} momentum breakout | "
+                    f"z={z_score:.2f}σ | trend={trend_direction} "
+                    f"({MOMENTUM_WINDOW} quotes) | "
+                    f"impact spike={current_impact:.4f}% "
+                    f"({impact_z:.2f}σ above mean)"
+                )
+                signal = {
+                    'timestamp':            datetime.utcnow().isoformat(),
+                    'signal_type':          'momentum_breakout',
+                    'pair':                 pair,
+                    'description':          description,
+                    'estimated_profit_pct': estimated_profit,
+                    'weighted_score':       total_score,
+                    'execute_candidate':    False,
+                    'condition_breakdown':  score_result['breakdown_str'],
+                    'z_score':              round(z_score, 4),
+                    'trend_direction':      trend_direction,
+                    'impact_z':             round(impact_z, 4),
+                }
+                logger.info(
+                    f"📈 Momentum breakout: {pair} | "
+                    f"z={z_score:.2f}σ | {trend_direction} "
+                    f"| impact {impact_z:.2f}σ | Score: {total_score}"
+                )
+                signals.append(signal)
+
+        except Exception as e:
+            logger.error(f"Error in momentum detection for {pair}: {e}")
+            continue
+
+    return signals
+
+
 def _get_quote_legs_for_signal(conn, signal: dict) -> list:
     """
     Fetch the most recent quote leg(s) for a signal's pair(s).
@@ -806,6 +948,7 @@ async def run_detection():
     all_signals.extend(detect_rate_divergence(conn))
     all_signals.extend(detect_triangular_arbitrage(conn))
     all_signals.extend(detect_impact_anomaly(conn))
+    all_signals.extend(detect_momentum_breakout(conn))
 
     if not all_signals:
         logger.info("No signals detected this cycle.")
@@ -866,6 +1009,10 @@ if __name__ == "__main__":
     print(f"  Min liquidity:           ${MIN_LIQUIDITY_USD:,}")
     print(f"  Duplicate window:        {DUPLICATE_WINDOW_MIN} minutes")
     print(f"  Divergence sigma:        {DIVERGENCE_SIGMA}σ")
+    print(f"  Momentum sigma:          {MOMENTUM_SIGMA}σ")
+    print(f"  Momentum window:         {MOMENTUM_WINDOW} consecutive quotes")
+    print(f"  Momentum impact spike:   > {MOMENTUM_IMPACT_SIGMA}σ above mean")
+    print(f"  Min profit (momentum):   {MIN_PROFIT_MOMENTUM}%  [strictest]")
     print(f"  Rolling window:          {ROLLING_WINDOW} quotes")
     print()
 

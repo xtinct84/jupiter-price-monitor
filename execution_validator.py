@@ -66,7 +66,12 @@ NET_PROFIT_THRESHOLD_TRIANGULAR  = 1.0   # Triangular 3-leg trades (higher fee b
 # 3:1 ratio formula constants
 DESIRED_NET_PROFIT_PCT     = 0.5       # Minimum acceptable net profit per trade
 MIN_GROSS_SLIPPAGE_RATIO   = 3.0       # Gross must be >= 3x derived slippage tolerance
-DYNAMIC_SLIPPAGE_BUFFER    = 0.8       # Execution slippage = derived_tolerance * this
+# Dynamic slippage multiplier tiers (based on depth / capital ratio)
+# Replaces flat 0.8 buffer — adjusts execution aggressiveness to liquidity
+SLIP_MULT_ULTRA   = 0.9    # depth > 50x capital  — ultra-liquid, push closer to limit
+SLIP_MULT_NORMAL  = 0.8    # depth > 20x capital  — standard market
+SLIP_MULT_THIN    = 0.6    # depth > 10x capital  — thin, extra conservative
+SLIP_MULT_REJECT  = None   # depth <= 10x capital — reject, not worth the risk
 DYNAMIC_SLIPPAGE_BUFFER    = 0.8       # dynamic_slippage = net_profit * this
 
 # =============================================================================
@@ -107,6 +112,7 @@ class ValidationResult:
     # Stage 5
     execute_gate_passed:    bool  = False
     dynamic_slippage_bps:   int   = 0       # Recommended slippage in basis points
+    multiplier_tier:        str   = ""      # Liquidity depth tier label
     recommendation:         str   = ""      # EXECUTE / ANALYSIS / REJECT
 
     def summary(self) -> str:
@@ -135,7 +141,7 @@ class ValidationResult:
             f"Fees            : {self.fee_pct:.4f}% ({self.legs} legs x {JUPITER_PLATFORM_FEE_PCT}%)",
             f"Net profit      : {self.net_profit_pct:.4f}%",
             f"Dyn. slip. set  : {self.dynamic_slippage_bps}bps "
-            f"(derived_tol * {DYNAMIC_SLIPPAGE_BUFFER})",
+            f"[{self.multiplier_tier}]",
             f"Recommendation  : {self.recommendation}",
         ]
         if not self.passed:
@@ -238,6 +244,29 @@ def check_slippage_ratio(gross_pct: float,
         else f'WARN — {ratio:.1f}:1 below {MIN_GROSS_SLIPPAGE_RATIO}:1 target'
     )
     return ratio, passes, warning
+
+
+def get_dynamic_multiplier(liquidity_ratio: float) -> tuple:
+    """
+    Return dynamic slippage multiplier based on depth/capital ratio.
+
+    Tiers:
+      > 50x capital  → 0.9  (ultra-liquid, can push closer to limit)
+      > 20x capital  → 0.8  (normal market conditions)
+      > 10x capital  → 0.6  (thin market, extra conservative)
+      <= 10x capital → None (reject — not worth the risk)
+
+    Returns:
+        (multiplier: float|None, tier_label: str)
+    """
+    if liquidity_ratio > 50:
+        return SLIP_MULT_ULTRA,  'ULTRA-LIQUID (0.9x)'
+    elif liquidity_ratio > 20:
+        return SLIP_MULT_NORMAL, 'NORMAL (0.8x)'
+    elif liquidity_ratio > 10:
+        return SLIP_MULT_THIN,   'THIN (0.6x)'
+    else:
+        return SLIP_MULT_REJECT, 'REJECT (≤10x capital)'
 
 
 def simulate_leg_slippage(price_impact_pct: float,
@@ -498,10 +527,23 @@ def validate_signal(signal: dict,
         logger.info(f"  Stage 5 FAIL: negative net profit")
         return result
 
-    # Dynamic slippage = derived_tolerance * buffer, expressed in basis points
-    # Using derived_tolerance (not net_profit) keeps it anchored to formula
-    dynamic_slippage_pct = derive_slippage_tolerance(gross_profit, fee_pct) * DYNAMIC_SLIPPAGE_BUFFER
+    # Dynamic multiplier based on liquidity depth tier
+    multiplier, mult_tier = get_dynamic_multiplier(result.liquidity_ratio)
+
+    # Reject if depth is insufficient regardless of profit
+    if multiplier is None:
+        result.reject_reason = (
+            f"Liquidity ratio {result.liquidity_ratio:.1f}x <= 10x capital — "
+            f"dynamic multiplier REJECT tier ({mult_tier})"
+        )
+        result.recommendation = 'REJECT'
+        logger.info(f"  Stage 5 REJECT: {result.reject_reason}")
+        return result
+
+    # Dynamic slippage = derived_tolerance * depth-adjusted multiplier
+    dynamic_slippage_pct = derive_slippage_tolerance(gross_profit, fee_pct) * multiplier
     dynamic_slippage_bps = int(dynamic_slippage_pct * 100)
+    result.multiplier_tier = mult_tier
 
     # Clamp to sensible range: 50bps minimum, 200bps maximum
     dynamic_slippage_bps = max(50, min(200, dynamic_slippage_bps))
@@ -522,7 +564,8 @@ def validate_signal(signal: dict,
         logger.info(
             f"  Stage 5 PASS: net {net_profit:.4f}% >= "
             f"{net_threshold}% | "
-            f"dynamic slippage {dynamic_slippage_bps}bps"
+            f"dynamic slippage {dynamic_slippage_bps}bps | "
+            f"multiplier {mult_tier}"
         )
     else:
         result.execute_gate_passed = False
@@ -613,7 +656,11 @@ if __name__ == "__main__":
     print(f"  Slippage formula:       (Gross - Fees - {DESIRED_NET_PROFIT_PCT}%) / 2")
     print(f"  Min gross/slip ratio:   {MIN_GROSS_SLIPPAGE_RATIO}:1  (3:1 rule of thumb)")
     print(f"  Slippage method:        worst-leg (most conservative)")
-    print(f"  Dynamic slippage:       derived_tolerance * {DYNAMIC_SLIPPAGE_BUFFER}")
+    print(f"  Dynamic slippage multiplier tiers:")
+    print(f"    > 50x capital  → {SLIP_MULT_ULTRA}  (ULTRA-LIQUID)")
+    print(f"    > 20x capital  → {SLIP_MULT_NORMAL}  (NORMAL)")
+    print(f"    > 10x capital  → {SLIP_MULT_THIN}  (THIN)")
+    print(f"    ≤ 10x capital  → REJECT")
     print()
 
     # Test case 1 — should PASS execute gate
