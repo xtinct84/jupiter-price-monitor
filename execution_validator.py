@@ -42,6 +42,13 @@ TRADE_CAPITAL_USD = float(os.getenv('TRADE_CAPITAL_USD', '50.0'))
 # Clamp to valid range $10–$100
 TRADE_CAPITAL_USD = max(10.0, min(100.0, TRADE_CAPITAL_USD))
 
+# Token decimals for quote capital derivation
+TOKEN_DECIMALS = {
+    'SOL': 9, 'USDC': 6, 'USDT': 6, 'JUP': 6,
+    'RAY': 6, 'BONK': 5, 'JTO': 9, 'PYTH': 6,
+    'WIF': 6, 'POPCAT': 9, 'MOUTAI': 9, 'MYRO': 9, 'WEN': 5
+}
+
 # Stage 1 — Gross divergence gate
 GROSS_DIVERGENCE_THRESHOLD = 1.5       # Minimum gross profit % to proceed
 
@@ -374,25 +381,34 @@ def simulate_total_slippage(legs_impact: list,
 # FEE CALCULATION
 # =============================================================================
 
-def calculate_fees_pct(capital_usd: float, num_legs: int) -> float:
+def calculate_fees_pct(capital_usd: float,
+                        num_legs: int,
+                        priority_tier: str = None) -> float:
     """
     Calculate total fee burden as % of capital.
 
     Components:
-    - Jupiter platform fee: 0.2% per swap leg
-    - Solana transaction fee: ~$0.0004 per tx (negligible at $50+)
+      - Jupiter platform fee : 0.2% per swap leg
+      - Solana base tx fee   : ~$0.0004 per tx
+      - Jito priority fee    : from .env PRIORITY_FEE_TIER (default medium=$0.05)
+
+    At $50 capital, medium priority adds ~0.10% — meaningful vs 1.5% gross.
 
     Args:
-        capital_usd: Trade capital in USD
-        num_legs:    Number of swap legs (2 for direct, 3 for triangular)
+        capital_usd:   Trade capital in USD
+        num_legs:      Number of swap legs (2 direct, 3 triangular)
+        priority_tier: Override tier. Defaults to PRIORITY_FEE_DEFAULT from .env
 
     Returns:
         Total fee as percentage of capital
     """
     try:
-        platform_fees_pct = JUPITER_PLATFORM_FEE_PCT * num_legs
-        solana_fee_pct = (SOLANA_TX_FEE_USD / capital_usd) * 100
-        return platform_fees_pct + solana_fee_pct
+        tier               = priority_tier or PRIORITY_FEE_DEFAULT
+        platform_fees_pct  = JUPITER_PLATFORM_FEE_PCT * num_legs
+        solana_base_pct    = (SOLANA_TX_FEE_USD / capital_usd) * 100
+        priority_fee_usd   = PRIORITY_FEE_TIER.get(tier, PRIORITY_FEE_TIER['medium'])
+        priority_fee_pct   = (priority_fee_usd / capital_usd) * 100
+        return platform_fees_pct + solana_base_pct + priority_fee_pct
     except Exception:
         return JUPITER_PLATFORM_FEE_PCT * num_legs
 
@@ -426,6 +442,55 @@ def validate_signal(signal: dict,
     result.gross_profit_pct = gross_profit
 
     num_legs = LEGS_PER_TRIANGULAR if 'triangular' in signal_type else LEGS_PER_DIRECT
+
+    # ─────────────────────────────────────────────
+    # STAGE 0 — Price Staleness Check
+    # Re-derive rate from latest quote and compare to rate at
+    # detection time. Drift > 0.2% means opportunity may be stale.
+    # ─────────────────────────────────────────────
+    STALE_PRICE_TOLERANCE_PCT = 0.2
+
+    detected_rate = signal.get('detected_rate', 0.0)
+    if detected_rate and detected_rate > 0 and quote_legs:
+        try:
+            latest_q = quote_legs[0]
+            in_sym_s0  = signal.get('input_symbol', '')
+            out_sym_s0 = signal.get('output_symbol', '')
+            in_dec_s0  = TOKEN_DECIMALS.get(in_sym_s0,  6)
+            out_dec_s0 = TOKEN_DECIMALS.get(out_sym_s0, 6)
+            in_amt_s0  = int(latest_q.get('in_amount',  0))
+            out_amt_s0 = int(latest_q.get('out_amount', 0))
+            if in_amt_s0 > 0 and out_amt_s0 > 0:
+                current_rate_s0 = (
+                    Decimal(out_amt_s0) / Decimal(10 ** out_dec_s0) /
+                    (Decimal(in_amt_s0) / Decimal(10 ** in_dec_s0))
+                )
+                rate_drift = abs(
+                    float(current_rate_s0) - detected_rate
+                ) / detected_rate * 100
+                result.price_drift_pct = round(rate_drift, 4)
+                if rate_drift > STALE_PRICE_TOLERANCE_PCT:
+                    result.reject_reason = (
+                        f'Price drifted {rate_drift:.4f}% since detection '
+                        f'(tolerance {STALE_PRICE_TOLERANCE_PCT}%)'
+                    )
+                    result.recommendation = 'STALE'
+                    logger.warning(
+                        f'  Stage 0 STALE: {signal.get("pair")} — '
+                        f'rate drifted {rate_drift:.4f}% '
+                        f'(detected={detected_rate:.6f} '
+                        f'current={float(current_rate_s0):.6f})'
+                    )
+                    return result
+                else:
+                    logger.info(
+                        f'  Stage 0 OK: rate drift {rate_drift:.4f}% '
+                        f'within {STALE_PRICE_TOLERANCE_PCT}% tolerance'
+                    )
+        except Exception as e:
+            logger.debug(f'  Stage 0: skipped — {e}')
+    else:
+        logger.debug('  Stage 0: no detected_rate in signal — skipped')
 
     # ─────────────────────────────────────────────
     # STAGE 1 — Gross Divergence Gate
