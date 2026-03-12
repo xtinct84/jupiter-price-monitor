@@ -58,6 +58,18 @@ LEGS_PER_DIRECT            = 2         # Number of swap legs in direct trade
 JUPITER_PLATFORM_FEE_PCT   = 0.2       # Jupiter platform fee per swap (%)
 SOLANA_TX_FEE_USD          = 0.0004    # ~0.000005 SOL at $85 per SOL
 
+# Jito priority fee tiers (in USD) — needed to avoid front-running
+# At small capital, medium tier (0.0005 SOL ≈ $0.05) adds ~0.1% cost on $50
+PRIORITY_FEE_TIER = {
+    'low':       0.01,   # ~0.0001 SOL — slow inclusion, low congestion
+    'medium':    0.05,   # ~0.0005 SOL — standard, default
+    'high':      0.15,   # ~0.001 SOL  — fast, moderate congestion
+    'desperate': 0.75,   # ~0.005 SOL  — during peak congestion
+}
+
+# Read priority tier from .env — defaults to 'medium' if not set
+PRIORITY_FEE_DEFAULT = os.getenv('PRIORITY_FEE_TIER', 'medium')
+
 # Stage 5 — Execute gate
 # Strategy-specific net profit thresholds
 NET_PROFIT_THRESHOLD_DIRECT      = 1.5   # Direct 2-leg trades (rate divergence, impact anomaly)
@@ -134,7 +146,8 @@ class ValidationResult:
             f"Gross profit    : {self.gross_profit_pct:.4f}%",
             f"Implied depth   : ${self.implied_depth_usd:,.0f} "
             f"({self.liquidity_ratio:.1f}x capital) [{self.liquidity_tier}]",
-            f"Worst-leg slip  : {self.simulated_slippage_pct:.4f}%",
+            f"Sim. slippage   : {self.simulated_slippage_pct:.4f}% "
+            f"({"accumulated" if self.legs == 3 else "worst-leg"})",
             f"Derived tol.    : (gross {self.gross_profit_pct:.4f}% - fees "
             f"{self.fee_pct:.4f}% - net {DESIRED_NET_PROFIT_PCT}%) / 2",
             f"Effective slip  : {self.slippage_pct:.4f}% (max of worst-leg vs derived)",
@@ -152,6 +165,38 @@ class ValidationResult:
 # =============================================================================
 # DEPTH INFERENCE
 # =============================================================================
+
+def get_quote_capital_usd(quote: dict, token_prices: dict = None) -> float:
+    """
+    Derive the actual USD value of the quote from its stored in_amount.
+
+    Replaces the hardcoded 50.0 assumption. Uses token_prices dict
+    (symbol → price_usd) if provided, otherwise falls back to
+    TRADE_CAPITAL_USD from .env so slippage scaling uses real reference size.
+
+    Args:
+        quote:        Quote dict with in_amount and input_symbol keys
+        token_prices: Optional {symbol: price_usd} from price_history table
+
+    Returns:
+        Estimated USD capital represented by this quote
+    """
+    try:
+        in_sym    = quote.get('input_symbol', '')
+        in_amount = int(quote.get('in_amount', 0))
+        if in_amount <= 0:
+            return TRADE_CAPITAL_USD
+        decimals      = TOKEN_DECIMALS.get(in_sym, 6)
+        token_amount  = in_amount / (10 ** decimals)
+        if token_prices and in_sym in token_prices:
+            price_usd = float(token_prices[in_sym])
+        else:
+            # Fallback: assume in_amount represents roughly TRADE_CAPITAL_USD
+            return TRADE_CAPITAL_USD
+        return token_amount * price_usd
+    except Exception:
+        return TRADE_CAPITAL_USD
+
 
 def infer_depth_usd(price_impact_pct: float,
                     capital_usd: float,
@@ -446,25 +491,56 @@ def validate_signal(signal: dict,
     result.stage_reached = 3
     result.legs = num_legs
 
-    quote_capital_estimate = 50.0
+    # Derive actual quote capital from stored in_amount + token prices
+    # Falls back to TRADE_CAPITAL_USD if price data unavailable
+    quote_capital_estimate = get_quote_capital_usd(
+        signal, signal.get('_token_prices', {})
+    )
+    logger.debug(
+        f"  Quote capital: ${quote_capital_estimate:.2f} "
+        f"(TRADE_CAPITAL_USD=${TRADE_CAPITAL_USD:.2f})"
+    )
+
+    is_triangular = num_legs == LEGS_PER_TRIANGULAR
 
     if result.liquidity_tier == "SAFE":
-        # Deep market — worst-leg assumption at 0.5%
-        worst_leg_slippage = 0.5
-        logger.info(
-            f"  Stage 3: SAFE tier — worst-leg assumption {worst_leg_slippage}%"
-        )
+        if is_triangular:
+            # Triangular: accumulate 0.5% per leg — slippage compounds across all 3
+            simulated_slippage = 0.5 * num_legs
+            logger.info(
+                f"  Stage 3: SAFE tier (triangular) — "
+                f"0.5% x {num_legs} legs = {simulated_slippage:.4f}%"
+            )
+        else:
+            # Direct 2-leg: worst-leg is sufficient, smaller compounding risk
+            simulated_slippage = 0.5
+            logger.info(
+                f"  Stage 3: SAFE tier (direct) — worst-leg assumption {simulated_slippage}%"
+            )
     else:
-        # SIMULATE tier — worst leg = highest price impact scaled to capital
-        worst_leg_slippage = simulate_leg_slippage(
-            thinnest_impact, result.capital_usd, quote_capital_estimate
-        )
-        logger.info(
-            f"  Stage 3: SIMULATE tier — "
-            f"worst-leg slippage {worst_leg_slippage:.4f}%"
-        )
+        if is_triangular:
+            # Triangular SIMULATE tier: sum slippage across all legs using actual quote size
+            per_leg_impacts = impacts if impacts else [thinnest_impact] * num_legs
+            simulated_slippage = simulate_total_slippage(
+                per_leg_impacts[:num_legs],
+                result.capital_usd,
+                quote_capital_estimate
+            )
+            logger.info(
+                f"  Stage 3: SIMULATE tier (triangular) — "
+                f"accumulated slippage {simulated_slippage:.4f}% across {num_legs} legs"
+            )
+        else:
+            # Direct SIMULATE tier: worst leg only
+            simulated_slippage = simulate_leg_slippage(
+                thinnest_impact, result.capital_usd, quote_capital_estimate
+            )
+            logger.info(
+                f"  Stage 3: SIMULATE tier (direct) — "
+                f"worst-leg slippage {simulated_slippage:.4f}%"
+            )
 
-    result.simulated_slippage_pct = worst_leg_slippage
+    result.simulated_slippage_pct = simulated_slippage
 
     # ─────────────────────────────────────────────
     # STAGE 4 — Net Profit + Dynamic Slippage Formula
@@ -496,7 +572,7 @@ def validate_signal(signal: dict,
 
     # Net profit using worst-leg slippage against derived tolerance
     # Use the more conservative of: worst-leg sim vs derived tolerance
-    effective_slippage = max(worst_leg_slippage, derived_tolerance)
+    effective_slippage = max(simulated_slippage, derived_tolerance)
     net_profit = gross_profit - effective_slippage - fee_pct
 
     result.gross_pct          = gross_profit
@@ -507,7 +583,7 @@ def validate_signal(signal: dict,
     logger.info(
         f"  Stage 4: gross {gross_profit:.4f}% | "
         f"derived tolerance {derived_tolerance:.4f}% | "
-        f"worst-leg {worst_leg_slippage:.4f}% | "
+        f"sim. slippage {simulated_slippage:.4f}% | "
         f"effective slippage {effective_slippage:.4f}% | "
         f"fees {fee_pct:.4f}% | net {net_profit:.4f}% | "
         f"ratio {ratio_msg}"
@@ -652,6 +728,11 @@ if __name__ == "__main__":
     print(f"  Liquidity safe:         > {LIQUIDITY_RATIO_SIMULATE}x capital")
     print(f"  Jupiter platform fee:   {JUPITER_PLATFORM_FEE_PCT}% per leg")
     print(f"  Solana tx fee:          ${SOLANA_TX_FEE_USD:.4f} per tx")
+    print(f"  Priority fee tier:      {PRIORITY_FEE_DEFAULT} "
+          f"(${PRIORITY_FEE_TIER.get(PRIORITY_FEE_DEFAULT, 0.05):.2f} USD)")
+    print(f"  Priority fee tiers:     low=$0.01 | medium=$0.05 | "
+          f"high=$0.15 | desperate=$0.75")
+    print(f"  Set via .env:           PRIORITY_FEE_TIER=medium")
     print(f"  Desired net profit:     {DESIRED_NET_PROFIT_PCT}%  (anchors slippage formula)")
     print(f"  Slippage formula:       (Gross - Fees - {DESIRED_NET_PROFIT_PCT}%) / 2")
     print(f"  Min gross/slip ratio:   {MIN_GROSS_SLIPPAGE_RATIO}:1  (3:1 rule of thumb)")

@@ -75,7 +75,9 @@ MIN_PROFIT_MOMENTUM         = 1.5   # Momentum breakout — strictest, fast reve
 MAX_PRICE_IMPACT_PCT  = 1.0      # Maximum acceptable price impact %
 MIN_LIQUIDITY_USD     = 500_000  # Minimum liquidity in USD
 MAX_SLIPPAGE_PCT      = 1.5      # Balanced MEV sweet spot (1.0% too tight, 2.0% sandwich risk)
-DUPLICATE_WINDOW_MIN  = 15       # Conservative window — stricter thresholds reduce noise naturally
+DUPLICATE_WINDOW_MIN  = 15       # Conservative baseline window
+DUPLICATE_WINDOW_MIN_FLOOR = 5   # Minimum window even at peak volatility
+DUPLICATE_WINDOW_MIN_CAP   = 15  # Maximum window (baseline)
 DIVERGENCE_SIGMA      = 2.0      # Standard deviations from rolling mean
 ROLLING_WINDOW        = 20       # Number of recent quotes for rolling stats
 
@@ -226,6 +228,62 @@ def get_latest_price(conn, symbol: str) -> dict:
         return {}
 
 
+def get_dynamic_duplicate_window(conn, pair: str) -> int:
+    """
+    Return a dynamic duplicate suppression window based on recent
+    price volatility for the base token of the pair.
+
+    High volatility → shorter window (opportunities evolve faster).
+    Low volatility  → full 15-minute window (reduce noise).
+
+    Volatility tiers (based on rolling std of recent prices):
+      σ > 2.0%  → 5  min  (high volatility)
+      σ > 0.5%  → 10 min  (moderate volatility)
+      else      → 15 min  (low/stable)
+
+    Returns:
+        Duplicate window in minutes
+    """
+    try:
+        base_sym = pair.split('/')[0]
+        # Fetch last 20 price records for the base token
+        query = """
+            SELECT price_usd FROM prices
+            WHERE symbol = ?
+            ORDER BY timestamp DESC
+            LIMIT 20
+        """
+        cursor = conn.cursor()
+        cursor.execute(query, (base_sym,))
+        rows = cursor.fetchall()
+        if len(rows) < 5:
+            return DUPLICATE_WINDOW_MIN_CAP
+
+        prices = [float(r[0]) for r in rows]
+        mean_price = sum(prices) / len(prices)
+        if mean_price == 0:
+            return DUPLICATE_WINDOW_MIN_CAP
+
+        # Rolling std as % of mean price
+        variance  = sum((p - mean_price) ** 2 for p in prices) / len(prices)
+        std_pct   = (variance ** 0.5 / mean_price) * 100
+
+        if std_pct > 2.0:
+            window = DUPLICATE_WINDOW_MIN_FLOOR      # 5 min — high volatility
+        elif std_pct > 0.5:
+            window = 10                               # 10 min — moderate
+        else:
+            window = DUPLICATE_WINDOW_MIN_CAP        # 15 min — stable
+
+        logger.debug(
+            f"  Duplicate window: {window}min for {pair} "
+            f"(volatility σ={std_pct:.3f}%)"
+        )
+        return window
+    except Exception:
+        return DUPLICATE_WINDOW_MIN_CAP
+
+
 def check_duplicate_signal(conn, pair: str, signal_type: str) -> bool:
     """
     Return True if identical signal fired within duplicate window.
@@ -234,13 +292,19 @@ def check_duplicate_signal(conn, pair: str, signal_type: str) -> bool:
     """
     key = (pair, signal_type)
     now = datetime.now()
-    window = timedelta(minutes=DUPLICATE_WINDOW_MIN)
+
+    # Dynamic window based on current price volatility
+    window_min = get_dynamic_duplicate_window(conn, pair)
+    window = timedelta(minutes=window_min)
 
     # Primary: in-memory cache
     if key in _signal_cache:
         age = (now - _signal_cache[key]).total_seconds()
         if now - _signal_cache[key] < window:
-            logger.info(f"🔇 Suppressed duplicate: {pair} ({signal_type}) — {age:.0f}s ago")
+            logger.info(
+                f"🔇 Suppressed duplicate: {pair} ({signal_type}) — "
+                f"{age:.0f}s ago (window={window_min}min)"
+            )
             return True
         else:
             del _signal_cache[key]
@@ -1043,7 +1107,7 @@ if __name__ == "__main__":
     print(f"  Max slippage:            {MAX_SLIPPAGE_PCT}%  [MEV sweet spot]")
     print(f"  Max price impact:        {MAX_PRICE_IMPACT_PCT}%")
     print(f"  Min liquidity:           ${MIN_LIQUIDITY_USD:,}")
-    print(f"  Duplicate window:        {DUPLICATE_WINDOW_MIN} minutes")
+    print(f"  Duplicate window:        dynamic ({DUPLICATE_WINDOW_MIN_FLOOR}-{DUPLICATE_WINDOW_MIN_CAP} min based on volatility)")
     print(f"  Divergence sigma:        {DIVERGENCE_SIGMA}σ")
     print(f"  Momentum sigma:          {MOMENTUM_SIGMA}σ")
     print(f"  Momentum window:         {MOMENTUM_WINDOW} consecutive quotes")
