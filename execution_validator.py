@@ -65,17 +65,52 @@ LEGS_PER_DIRECT            = 2         # Number of swap legs in direct trade
 JUPITER_PLATFORM_FEE_PCT   = 0.2       # Jupiter platform fee per swap (%)
 SOLANA_TX_FEE_USD          = 0.0004    # ~0.000005 SOL at $85 per SOL
 
-# Jito priority fee tiers (in USD) — needed to avoid front-running
-# At small capital, medium tier (0.0005 SOL ≈ $0.05) adds ~0.1% cost on $50
+# Jito priority fee tiers (in USD) — realistic lamport-based estimates
+# Minimum Jito tip: 1,000 lamports (~$0.00018). Competitive range: 10k–50k lamports.
+# 'none' tier: skips Jito entirely — suitable for $10–$19 capital (sandwich risk
+#              minimal at this size; fixed tip cost is disproportionate)
+# 'low' tier:  ~10,000 lamports ($0.002) — calm market, low congestion
+# 'medium':    ~27,000 lamports ($0.005) — standard DEX arb, most sessions
+# 'high':      ~54,000 lamports ($0.010) — elevated congestion
+# 'desperate': ~270,000 lamports ($0.050) — peak congestion / volatile events
 PRIORITY_FEE_TIER = {
-    'low':       0.01,   # ~0.0001 SOL — slow inclusion, low congestion
-    'medium':    0.05,   # ~0.0005 SOL — standard, default
-    'high':      0.15,   # ~0.001 SOL  — fast, moderate congestion
-    'desperate': 0.75,   # ~0.005 SOL  — during peak congestion
+    'none':      0.000,  # No Jito tip — $10–$19 capital only
+    'low':       0.002,  # ~10,000 lamports — $20–$60 capital
+    'medium':    0.005,  # ~27,000 lamports — $61–$100 capital (default)
+    'high':      0.010,  # ~54,000 lamports — manual override, high congestion
+    'desperate': 0.050,  # ~270,000 lamports — extreme events only
 }
 
-# Read priority tier from .env — defaults to 'medium' if not set
-PRIORITY_FEE_DEFAULT = os.getenv('PRIORITY_FEE_TIER', 'medium')
+# Capital-based Jito tier formula
+# Tiers are derived from TRADE_CAPITAL_USD unless overridden in .env
+# $10–$19  → none   (tip cost disproportionate; sandwich risk negligible at this size)
+# $20–$60  → low    (~10k lamports, $0.002)
+# $61–$100 → medium (~27k lamports, $0.005)
+# .env PRIORITY_FEE_TIER= always wins if explicitly set
+def get_capital_based_tier(capital: float) -> str:
+    """
+    Derive Jito tip tier from trade capital.
+    Only used when PRIORITY_FEE_TIER is not set in .env.
+
+    Args:
+        capital: Trade capital in USD
+
+    Returns:
+        Tier string: 'none' | 'low' | 'medium'
+    """
+    if capital < 20.0:
+        return 'none'
+    elif capital <= 60.0:
+        return 'low'
+    else:
+        return 'medium'
+
+_env_tier = os.getenv('PRIORITY_FEE_TIER', '').strip().lower()
+PRIORITY_FEE_DEFAULT = (
+    _env_tier
+    if _env_tier in PRIORITY_FEE_TIER
+    else get_capital_based_tier(TRADE_CAPITAL_USD)
+)
 
 # Stage 5 — Execute gate
 # Strategy-specific net profit thresholds
@@ -390,9 +425,11 @@ def calculate_fees_pct(capital_usd: float,
     Components:
       - Jupiter platform fee : 0.2% per swap leg
       - Solana base tx fee   : ~$0.0004 per tx
-      - Jito priority fee    : from .env PRIORITY_FEE_TIER (default medium=$0.05)
+      - Jito priority fee    : capital-based tier (none/low/medium) or .env override
+                               $10–$19 = none ($0.000), $20–$60 = low ($0.002),
+                               $61–$100 = medium ($0.005). .env wins if set.
 
-    At $50 capital, medium priority adds ~0.10% — meaningful vs 1.5% gross.
+    At $50 capital, low tier adds ~0.004% — negligible vs 1.5% gross target.
 
     Args:
         capital_usd:   Trade capital in USD

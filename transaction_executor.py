@@ -37,17 +37,19 @@ BASE_BACKOFF_MS      = 100     # Initial wait between retries (milliseconds)
 BACKOFF_MULTIPLIER   = 2       # Exponential base: wait doubles each retry
 
 # Priority fee escalation per retry (SOL amounts)
-# Attempt 0 → base tier (from .env PRIORITY_FEE_TIER)
+# Calibrated to realistic lamport ranges — not worst-case event pricing
+# Attempt 0 → base tier (capital-based or .env override)
 # Attempt 1 → one tier up
 # Attempt 2 → two tiers up (capped at desperate)
 PRIORITY_FEE_SOL = {
-    'low':       0.0001,   # ~$0.01 at $85/SOL
-    'medium':    0.0005,   # ~$0.05
-    'high':      0.001,    # ~$0.15
-    'desperate': 0.005,    # ~$0.75 — only on final retry
+    'none':      0.000000,  # No tip — $10-$19 capital
+    'low':       0.000011,  # ~10,000 lamports — $20-$60 capital
+    'medium':    0.000027,  # ~27,000 lamports — $61-$100 capital
+    'high':      0.000054,  # ~54,000 lamports — manual override
+    'desperate': 0.000270,  # ~270,000 lamports — extreme events only
 }
 
-PRIORITY_TIER_ORDER = ['low', 'medium', 'high', 'desperate']
+PRIORITY_TIER_ORDER = ['none', 'low', 'medium', 'high', 'desperate']
 
 
 # ─────────────────────────────────────────────
@@ -108,9 +110,11 @@ def get_escalated_fee_tier(base_tier: str, attempt: int) -> tuple:
         (tier_name: str, fee_sol: float)
 
     Example:
-        base='medium', attempt=0 → ('medium', 0.0005)
-        base='medium', attempt=1 → ('high',   0.001)
-        base='medium', attempt=2 → ('desperate', 0.005)
+        base='low',    attempt=0 → ('low',      0.000011)
+        base='low',    attempt=1 → ('medium',   0.000027)
+        base='medium', attempt=0 → ('medium',   0.000027)
+        base='medium', attempt=1 → ('high',     0.000054)
+        base='medium', attempt=2 → ('desperate',0.000270)
     """
     try:
         base_idx = PRIORITY_TIER_ORDER.index(base_tier)

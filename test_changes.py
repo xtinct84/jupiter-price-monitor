@@ -71,6 +71,7 @@ from execution_validator import (
     get_dynamic_multiplier, derive_slippage_tolerance,
     validate_signal, ValidationResult,
     LEGS_PER_DIRECT, LEGS_PER_TRIANGULAR,
+    get_capital_based_tier,
 )
 
 # TOKEN_DECIMALS defined locally — not exported by execution_validator
@@ -126,15 +127,44 @@ test(
 )
 
 # V3: PRIORITY_FEE_TIER tiers
-test("V3  PRIORITY_FEE_TIER has 4 tiers",
-     len(PRIORITY_FEE_TIER) == 4,
-     expected=4, actual=len(PRIORITY_FEE_TIER))
-test("V3b medium tier = $0.05",
-     PRIORITY_FEE_TIER['medium'] == 0.05,
-     expected=0.05, actual=PRIORITY_FEE_TIER.get('medium'))
-test("V3c desperate tier = $0.75",
-     PRIORITY_FEE_TIER['desperate'] == 0.75,
-     expected=0.75, actual=PRIORITY_FEE_TIER.get('desperate'))
+test("V3  PRIORITY_FEE_TIER has 5 tiers (includes none)",
+     len(PRIORITY_FEE_TIER) == 5,
+     expected=5, actual=len(PRIORITY_FEE_TIER))
+test("V3b none tier = $0.000",
+     PRIORITY_FEE_TIER['none'] == 0.000,
+     expected=0.000, actual=PRIORITY_FEE_TIER.get('none'))
+test("V3c low tier = $0.002",
+     PRIORITY_FEE_TIER['low'] == 0.002,
+     expected=0.002, actual=PRIORITY_FEE_TIER.get('low'))
+test("V3d medium tier = $0.005",
+     PRIORITY_FEE_TIER['medium'] == 0.005,
+     expected=0.005, actual=PRIORITY_FEE_TIER.get('medium'))
+test("V3e desperate tier = $0.050",
+     PRIORITY_FEE_TIER['desperate'] == 0.050,
+     expected=0.050, actual=PRIORITY_FEE_TIER.get('desperate'))
+
+# V3f: capital-based tier formula
+test("V3f capital $10 → none tier",
+     get_capital_based_tier(10.0) == 'none',
+     expected='none', actual=get_capital_based_tier(10.0))
+test("V3g capital $19.99 → none tier",
+     get_capital_based_tier(19.99) == 'none',
+     expected='none', actual=get_capital_based_tier(19.99))
+test("V3h capital $20 → low tier",
+     get_capital_based_tier(20.0) == 'low',
+     expected='low', actual=get_capital_based_tier(20.0))
+test("V3i capital $50 → low tier",
+     get_capital_based_tier(50.0) == 'low',
+     expected='low', actual=get_capital_based_tier(50.0))
+test("V3j capital $60 → low tier",
+     get_capital_based_tier(60.0) == 'low',
+     expected='low', actual=get_capital_based_tier(60.0))
+test("V3k capital $61 → medium tier",
+     get_capital_based_tier(61.0) == 'medium',
+     expected='medium', actual=get_capital_based_tier(61.0))
+test("V3l capital $100 → medium tier",
+     get_capital_based_tier(100.0) == 'medium',
+     expected='medium', actual=get_capital_based_tier(100.0))
 
 # V4: get_quote_capital_usd with price data
 sol_decimals = TOKEN_DECIMALS['SOL']   # 9
@@ -239,11 +269,14 @@ test(
 # V12: Net profit lower than old flat-fee calculation
 old_fee = 0.2 * 2 + (0.0004 / 50) * 100           # platform + base only
 new_fee = calculate_fees_pct(50.0, 2, 'medium')     # includes priority
+# At $50 capital formula now gives 'low' tier ($0.002)
+fee_low_50  = calculate_fees_pct(50.0,  2, 'low')
+fee_none_50 = calculate_fees_pct(50.0,  2, 'none')
 test(
-    "V12 New fee > old fee confirming priority fee is included",
-    new_fee > old_fee,
-    expected=f"> {old_fee:.4f}%", actual=f"{new_fee:.4f}%",
-    note=f"difference: +{new_fee - old_fee:.4f}% (Jito medium $0.05 on $50)"
+    "V12 low tier fee > none tier fee at $50 capital",
+    fee_low_50 > fee_none_50,
+    expected=f"> {fee_none_50:.4f}%", actual=f"{fee_low_50:.4f}%",
+    note=f"low tier adds ${0.002:.3f} Jito tip on $50 = {0.002/50*100:.4f}%"
 )
 
 # ═══════════════════════════════════════════════════════
@@ -332,12 +365,19 @@ if detector_loaded:
 print("\n── Executor Tests ──────────────────────────────────")
 
 # E1: Fee escalation per attempt
-tier0, sol0 = get_escalated_fee_tier('medium', 0)
-tier1, sol1 = get_escalated_fee_tier('medium', 1)
-tier2, sol2 = get_escalated_fee_tier('medium', 2)
-test("E1  medium attempt 0 → medium",    tier0 == 'medium',    expected='medium',    actual=tier0)
-test("E1b medium attempt 1 → high",      tier1 == 'high',      expected='high',      actual=tier1)
-test("E1c medium attempt 2 → desperate", tier2 == 'desperate', expected='desperate', actual=tier2)
+tier0, sol0 = get_escalated_fee_tier('low', 0)
+tier1, sol1 = get_escalated_fee_tier('low', 1)
+tier2, sol2 = get_escalated_fee_tier('low', 2)
+test("E1  low attempt 0 → low",       tier0 == 'low',       expected='low',       actual=tier0)
+test("E1b low attempt 1 → medium",    tier1 == 'medium',    expected='medium',    actual=tier1)
+test("E1c low attempt 2 → high",      tier2 == 'high',      expected='high',      actual=tier2)
+
+tier_m0, _ = get_escalated_fee_tier('medium', 0)
+tier_m1, _ = get_escalated_fee_tier('medium', 1)
+tier_m2, _ = get_escalated_fee_tier('medium', 2)
+test("E1d medium attempt 0 → medium",    tier_m0 == 'medium',    expected='medium',    actual=tier_m0)
+test("E1e medium attempt 1 → high",      tier_m1 == 'high',      expected='high',      actual=tier_m1)
+test("E1f medium attempt 2 → desperate", tier_m2 == 'desperate', expected='desperate', actual=tier_m2)
 
 # E2: Cap at desperate
 tier3, _ = get_escalated_fee_tier('desperate', 0)
