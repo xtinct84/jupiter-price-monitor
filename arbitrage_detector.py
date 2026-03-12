@@ -91,6 +91,15 @@ MOMENTUM_PAIRS = [
     ('PYTH', 'USDC'),
 ]
 
+# Pairs excluded from ALL detection strategies
+# Thin depth, decimal precision artifacts, or zero liquidity
+EXCLUDED_PAIRS = {
+    'BONK/SOL',    # 5-decimal precision artifacts + thin depth
+    'MOUTAI/USDC', # Zero liquidity
+    'MYRO/USDC',   # Zero liquidity
+    'WEN/USDC',    # Zero liquidity
+}
+
 # --- Telegram configuration ---
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID', '')
@@ -480,6 +489,10 @@ def detect_rate_divergence(conn) -> list:
     for in_sym, out_sym in monitored_pairs:
         pair = f"{in_sym}/{out_sym}"
 
+        # Exclusion check — skip thin/problematic pairs
+        if pair in EXCLUDED_PAIRS:
+            continue
+
         # Pre-flight duplicate check — skip scoring entirely if suppressed
         if check_duplicate_signal(conn, pair, 'rate_divergence'):
             logger.info(f"🔇 Skipping {pair} rate_divergence — duplicate within {DUPLICATE_WINDOW_MIN} min")
@@ -540,6 +553,11 @@ def detect_triangular_arbitrage(conn) -> list:
         pair_bc = f"{token_b}/{token_c}"
         pair_ca = f"{token_c}/{token_a}"
         path_label = f"{token_a}->{token_b}->{token_c}->{token_a}"
+
+        # Exclusion check — skip paths containing excluded tokens
+        path_pairs = [pair_ab, pair_bc, pair_ca]
+        if any(p in EXCLUDED_PAIRS for p in path_pairs):
+            continue
 
         # Pre-flight duplicate check
         if check_duplicate_signal(conn, path_label, 'triangular_arbitrage'):
@@ -630,6 +648,10 @@ def detect_impact_anomaly(conn) -> list:
 
     for in_sym, out_sym in monitored_pairs:
         pair = f"{in_sym}/{out_sym}"
+
+        # Exclusion check
+        if pair in EXCLUDED_PAIRS:
+            continue
 
         # Pre-flight duplicate check
         if check_duplicate_signal(conn, pair, 'impact_anomaly'):
@@ -801,6 +823,20 @@ def detect_momentum_breakout(conn) -> list:
         price_data = get_latest_price(conn, in_sym)
 
         try:
+            # Compute rate column if not present (not stored in DB, derived on-the-fly)
+            if 'rate' not in recent_quotes.columns:
+                in_dec  = TOKEN_DECIMALS.get(in_sym, 6)
+                out_dec = TOKEN_DECIMALS.get(out_sym, 6)
+                recent_quotes = recent_quotes.copy()
+                recent_quotes['rate'] = (
+                    (recent_quotes['out_amount'].astype(float) / (10 ** out_dec)) /
+                    (recent_quotes['in_amount'].astype(float)  / (10 ** in_dec))
+                    .replace(0, float('nan'))
+                )
+                recent_quotes = recent_quotes.dropna(subset=['rate'])
+                if len(recent_quotes) < MOMENTUM_WINDOW + 3:
+                    continue
+
             rates = recent_quotes['rate'].astype(float)
             impacts = recent_quotes['price_impact_pct'].astype(float)
 
