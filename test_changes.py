@@ -259,8 +259,11 @@ for mod in ['pandas', 'sqlite3']:
     if mod not in sys.modules:
         sys.modules[mod] = types.ModuleType(mod)
 
+# Resolve path relative to this script — works on Windows and Linux
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_detector_path = os.path.join(_script_dir, "arbitrage_detector.py")
 spec = importlib.util.spec_from_file_location(
-    "arbitrage_detector", "/mnt/user-data/outputs/arbitrage_detector.py"
+    "arbitrage_detector", _detector_path
 )
 det = importlib.util.module_from_spec(spec)
 try:
