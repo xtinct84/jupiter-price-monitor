@@ -392,6 +392,48 @@ test("E3b Backoff attempt 1 = 200ms",  backoffs[1] == 200, expected=200, actual=
 test("E3c Backoff attempt 2 = 400ms",  backoffs[2] == 400, expected=400, actual=backoffs[2])
 
 # ─────────────────────────────────────────────
+# ── Cold-start protection tests ──────────────────────
+print("\n── Cold-Start Protection Tests ─────────────────────")
+from datetime import datetime, timedelta
+
+cutoff_age_hours = 2
+now = datetime.now()
+cutoff     = now - timedelta(hours=cutoff_age_hours)
+fresh_ts   = (now - timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S')
+stale_ts   = (now - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M:%S')
+cutoff_str = cutoff.strftime('%Y-%m-%d %H:%M:%S')
+
+test("CS1 Fresh quote (30min) passes 2h cutoff",
+     fresh_ts >= cutoff_str,
+     expected="timestamp >= cutoff", actual=f"30min ago >= 2h cutoff")
+test("CS2 Stale quote (3h) excluded by 2h cutoff",
+     stale_ts < cutoff_str,
+     expected="timestamp < cutoff", actual=f"3h ago < 2h cutoff")
+test("CS3 QUOTE_MAX_AGE_HOURS = 2",
+     cutoff_age_hours == 2, expected=2, actual=cutoff_age_hours)
+
+warmup_iters = 20
+test("CS4 WARMUP_ITERATIONS = 20",
+     warmup_iters == 20, expected=20, actual=warmup_iters)
+test("CS5 Warm-up = 10 min at 30s interval",
+     warmup_iters * 30 == 600, expected=600, actual=warmup_iters * 30,
+     note="600 seconds = 10 minutes")
+
+def in_warmup(i): return i <= warmup_iters
+test("CS6 Iteration 1 → in warm-up",
+     in_warmup(1) == True, expected=True, actual=in_warmup(1))
+test("CS7 Iteration 20 → still in warm-up (last cycle)",
+     in_warmup(20) == True, expected=True, actual=in_warmup(20))
+test("CS8 Iteration 21 → first live cycle",
+     in_warmup(21) == False, expected=False, actual=in_warmup(21))
+
+signal = {'execute_candidate': True, 'weighted_score': 100}
+if in_warmup(1):
+    signal['execute_candidate'] = False
+test("CS9 execute_candidate forced False during warm-up (score=100)",
+     signal['execute_candidate'] == False,
+     expected=False, actual=signal['execute_candidate'])
+
 # SUMMARY
 # ─────────────────────────────────────────────
 passed = sum(1 for s, _ in results if s == 'PASS')

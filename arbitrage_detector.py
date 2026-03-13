@@ -81,6 +81,22 @@ DUPLICATE_WINDOW_MIN_CAP   = 15  # Maximum window (baseline)
 DIVERGENCE_SIGMA      = 2.0      # Standard deviations from rolling mean
 ROLLING_WINDOW        = 20       # Number of recent quotes for rolling stats
 
+# --- Cold-start protection ---
+# After a session gap (restart/inactivity), stale DB quotes produce a false
+# baseline — today's price vs. old prices looks like an arbitrage opportunity.
+# Two guards prevent this:
+#   1. QUOTE_MAX_AGE_HOURS: get_recent_quotes() only returns quotes from the
+#      current session window. Stale historical quotes are ignored entirely.
+#   2. WARMUP_ITERATIONS: even with fresh quotes, the first N detection cycles
+#      are treated as data collection only — no signals generated until the
+#      rolling window has >= ROLLING_WINDOW fresh data points per pair.
+QUOTE_MAX_AGE_HOURS   = 2        # Max age of quotes used for rolling baseline
+WARMUP_ITERATIONS     = 20       # Iterations before signaling begins
+                                  # 20 iterations x 30s interval = ~10 min warm-up
+
+# Module-level iteration counter — incremented by run_detection() each call
+_detection_iteration  = 0
+
 # --- Momentum breakout configuration ---
 MOMENTUM_SIGMA        = 1.5      # sigma threshold for momentum divergence
 MOMENTUM_WINDOW       = 5        # Consecutive quotes for trend confirmation (~2.5 min)
@@ -168,16 +184,24 @@ def ensure_signals_table(conn):
 
 
 def get_recent_quotes(conn, pair: str, limit: int = ROLLING_WINDOW) -> pd.DataFrame:
-    """Fetch the most recent N quote records for a trading pair"""
+    """
+    Fetch the most recent N quote records for a trading pair.
+
+    Only returns quotes within QUOTE_MAX_AGE_HOURS of now to prevent stale
+    DB records from a previous session corrupting the rolling baseline on
+    cold start. This is the primary guard against false signals at restart.
+    """
+    cutoff = (datetime.now() - timedelta(hours=QUOTE_MAX_AGE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')
     query = """
         SELECT timestamp, in_amount, out_amount, price_impact_pct, slippage_bps
         FROM quotes
         WHERE pair = ?
+          AND timestamp >= ?
         ORDER BY timestamp DESC
         LIMIT ?
     """
     try:
-        df = pd.read_sql_query(query, conn, params=(pair, limit))
+        df = pd.read_sql_query(query, conn, params=(pair, cutoff, limit))
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         return df
     except Exception as e:
@@ -1044,21 +1068,39 @@ def _get_quote_legs_for_signal(conn, signal: dict) -> list:
 
 async def run_detection():
     """
-    Main entry point. Runs all three detection strategies,
-    logs signals to database, and sends Telegram alerts.
-    Called after each fetch cycle or run independently.
+    Main entry point. Runs all detection strategies, logs signals to
+    database, and sends Telegram alerts.
+
+    Cold-start protection:
+      - Iteration counter is incremented every call.
+      - For the first WARMUP_ITERATIONS calls, detection still runs but
+        all signals are demoted to ANALYSIS — no execute candidates, no
+        Telegram alerts. This ensures the rolling baseline is built from
+        fresh quotes before any signal is acted upon.
     """
+    global _detection_iteration
+    _detection_iteration += 1
+
     conn = get_connection()
     if conn is None:
         return
 
     ensure_signals_table(conn)
 
-    logger.info("🔍 Running arbitrage detection...")
+    in_warmup = _detection_iteration <= WARMUP_ITERATIONS
+    if in_warmup:
+        remaining = WARMUP_ITERATIONS - _detection_iteration + 1
+        logger.info(
+            f"🔍 Running arbitrage detection... "
+            f"[WARM-UP {_detection_iteration}/{WARMUP_ITERATIONS} — "
+            f"{remaining} iterations until signals enabled]"
+        )
+    else:
+        logger.info("🔍 Running arbitrage detection...")
 
     all_signals = []
 
-    # Run all three strategies
+    # Run all four strategies
     all_signals.extend(detect_rate_divergence(conn))
     all_signals.extend(detect_triangular_arbitrage(conn))
     all_signals.extend(detect_impact_anomaly(conn))
@@ -1071,6 +1113,11 @@ async def run_detection():
 
     # Validate, log and alert
     for signal in all_signals:
+        # During warm-up: demote all signals to ANALYSIS regardless of score
+        # Prevents cold-start false positives from reaching Telegram
+        if in_warmup:
+            signal['execute_candidate'] = False
+
         # Build quote_legs list from DB for this signal
         quote_legs = _get_quote_legs_for_signal(conn, signal)
 
@@ -1128,6 +1175,8 @@ if __name__ == "__main__":
     print(f"  Momentum impact spike:   > {MOMENTUM_IMPACT_SIGMA}σ above mean")
     print(f"  Min profit (momentum):   {MIN_PROFIT_MOMENTUM}%  [strictest]")
     print(f"  Rolling window:          {ROLLING_WINDOW} quotes")
+    print(f"  Quote max age:           {QUOTE_MAX_AGE_HOURS}h (stale quotes excluded from baseline)")
+    print(f"  Warm-up iterations:      {WARMUP_ITERATIONS} ({WARMUP_ITERATIONS * 30 // 60} min — no alerts until baseline established)")
     print()
 
     telegram_status = "✅ Configured" if TELEGRAM_BOT_TOKEN else "⚠️  Not configured"
