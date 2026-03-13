@@ -21,6 +21,9 @@ Usage:
 """
 
 import os
+import time
+import json
+import urllib.request
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -65,27 +68,136 @@ LEGS_PER_DIRECT            = 2         # Number of swap legs in direct trade
 JUPITER_PLATFORM_FEE_PCT   = 0.2       # Jupiter platform fee per swap (%)
 SOLANA_TX_FEE_USD          = 0.0004    # ~0.000005 SOL at $85 per SOL
 
-# Jito priority fee tiers (in USD) — realistic lamport-based estimates
-# Minimum Jito tip: 1,000 lamports (~$0.00018). Competitive range: 10k–50k lamports.
-# 'none' tier: skips Jito entirely — suitable for $10–$19 capital (sandwich risk
-#              minimal at this size; fixed tip cost is disproportionate)
-# 'low' tier:  ~10,000 lamports ($0.002) — calm market, low congestion
-# 'medium':    ~27,000 lamports ($0.005) — standard DEX arb, most sessions
-# 'high':      ~54,000 lamports ($0.010) — elevated congestion
-# 'desperate': ~270,000 lamports ($0.050) — peak congestion / volatile events
+# ── Jito tip floor — live API + capital-based fallback ────────────────────────
+#
+# Primary:  fetch_jito_tip_floor() calls the Jito REST API once per minute.
+#           Returns EMA-smoothed 50th-percentile and raw percentile lamport tips.
+#           Results are cached for JITO_CACHE_TTL_S seconds to avoid hammering
+#           the endpoint on every signal in the same detection cycle.
+#
+# Fallback: if the API is unreachable or returns unexpected data, PRIORITY_FEE_TIER
+#           hardcoded USD values are used (same realistic lamport estimates as before).
+#
+# Tier → percentile mapping:
+#   none      ($10–$19)  → $0.000   — no tip at all
+#   low       ($20–$60)  → EMA p50  — calm baseline, smoothed to reduce spikes
+#   medium    ($61–$100) → p75      — slightly above median for better inclusion
+#   high      (manual)   → p95      — competitive arb / elevated congestion
+#   desperate (manual)   → p99      — extreme events only
+#
+# .env PRIORITY_FEE_TIER= always wins if explicitly set (bypasses live lookup).
+
+JITO_TIP_FLOOR_URL  = "https://bundles-api-rest.jito.wtf/api/v1/bundles/tip_floor"
+JITO_CACHE_TTL_S    = 60        # Re-fetch at most once per minute
+JITO_TIMEOUT_S      = 3         # Abort if API takes longer than 3s
+LAMPORTS_PER_SOL    = 1_000_000_000
+
+# Fallback USD values used when live API is unavailable
+# Calibrated to realistic lamport ranges — not worst-case event pricing
 PRIORITY_FEE_TIER = {
     'none':      0.000,  # No Jito tip — $10–$19 capital only
-    'low':       0.002,  # ~10,000 lamports — $20–$60 capital
-    'medium':    0.005,  # ~27,000 lamports — $61–$100 capital (default)
-    'high':      0.010,  # ~54,000 lamports — manual override, high congestion
-    'desperate': 0.050,  # ~270,000 lamports — extreme events only
+    'low':       0.002,  # ~10,000 lamports EMA p50 fallback
+    'medium':    0.005,  # ~27,000 lamports p75 fallback
+    'high':      0.010,  # ~54,000 lamports p95 fallback
+    'desperate': 0.050,  # ~270,000 lamports p99 fallback
 }
 
-# Capital-based Jito tier formula
-# Tiers are derived from TRADE_CAPITAL_USD unless overridden in .env
+# Cache state — module-level, shared across all calls within a process
+_jito_cache: dict = {}   # keys: 'data', 'fetched_at'
+
+
+def fetch_jito_tip_floor(sol_price_usd: float = 90.0) -> dict:
+    """
+    Fetch the current Jito tip floor from the REST API with 60-second caching.
+
+    Returns a dict of tier -> USD amount derived from live lamport percentiles:
+        {
+            'none':      0.0,
+            'low':       <EMA p50 in USD>,
+            'medium':    <p75 in USD>,
+            'high':      <p95 in USD>,
+            'desperate': <p99 in USD>,
+            'source':    'live' | 'cache' | 'fallback',
+            'fetched_at': <unix timestamp>,
+        }
+
+    Falls back to PRIORITY_FEE_TIER hardcoded values on any error.
+
+    Args:
+        sol_price_usd: Current SOL/USD price for lamport conversion.
+                       Caller should pass live price from prices table when available.
+    """
+    global _jito_cache
+
+    now = time.time()
+
+    # Return cached result if still fresh
+    if _jito_cache.get('fetched_at', 0) + JITO_CACHE_TTL_S > now:
+        cached = dict(_jito_cache['data'])
+        cached['source'] = 'cache'
+        return cached
+
+    try:
+        req = urllib.request.Request(
+            JITO_TIP_FLOOR_URL,
+            headers={'Accept': 'application/json', 'User-Agent': 'jupiter-arb-bot/2.2'},
+        )
+        with urllib.request.urlopen(req, timeout=JITO_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read().decode('utf-8'))
+
+        # API returns a list — take the most recent entry
+        entry = payload[0] if isinstance(payload, list) else payload
+
+        def lamps_to_usd(lamports: int) -> float:
+            return round((int(lamports) / LAMPORTS_PER_SOL) * sol_price_usd, 6)
+
+        result = {
+            'none':      0.0,
+            'low':       lamps_to_usd(entry['ema_landed_tips_50th_percentile']),
+            'medium':    lamps_to_usd(entry['landed_tips_75th_percentile']),
+            'high':      lamps_to_usd(entry['landed_tips_95th_percentile']),
+            'desperate': lamps_to_usd(entry['landed_tips_99th_percentile']),
+            'source':    'live',
+            'fetched_at': now,
+        }
+
+        _jito_cache = {'data': result, 'fetched_at': now}
+        logger.info(
+            f"  Jito tip floor (live): low=${result['low']:.5f} "
+            f"med=${result['medium']:.5f} "
+            f"high=${result['high']:.5f} "
+            f"(SOL=${sol_price_usd:.2f})"
+        )
+        return result
+
+    except Exception as e:
+        logger.warning(f"  Jito tip floor API unavailable ({e}) — using hardcoded fallback")
+        fallback = dict(PRIORITY_FEE_TIER)
+        fallback['source']     = 'fallback'
+        fallback['fetched_at'] = now
+        return fallback
+
+
+def get_live_tip_usd(tier: str, sol_price_usd: float = 90.0) -> float:
+    """
+    Return the current Jito tip in USD for the given tier.
+    Uses the live API with caching; falls back to hardcoded values if unavailable.
+
+    Args:
+        tier:          One of 'none' | 'low' | 'medium' | 'high' | 'desperate'
+        sol_price_usd: Live SOL/USD price for lamport conversion
+
+    Returns:
+        Tip amount in USD
+    """
+    tips = fetch_jito_tip_floor(sol_price_usd)
+    return tips.get(tier, PRIORITY_FEE_TIER.get(tier, 0.0))
+
+
+# Capital-based tier formula — unchanged
 # $10–$19  → none   (tip cost disproportionate; sandwich risk negligible at this size)
-# $20–$60  → low    (~10k lamports, $0.002)
-# $61–$100 → medium (~27k lamports, $0.005)
+# $20–$60  → low    (EMA p50 — calm market baseline)
+# $61–$100 → medium (p75 — slightly above median for better inclusion)
 # .env PRIORITY_FEE_TIER= always wins if explicitly set
 def get_capital_based_tier(capital: float) -> str:
     """
@@ -105,13 +217,13 @@ def get_capital_based_tier(capital: float) -> str:
     else:
         return 'medium'
 
+
 _env_tier = os.getenv('PRIORITY_FEE_TIER', '').strip().lower()
 PRIORITY_FEE_DEFAULT = (
     _env_tier
     if _env_tier in PRIORITY_FEE_TIER
     else get_capital_based_tier(TRADE_CAPITAL_USD)
 )
-
 # Stage 5 — Execute gate
 # Strategy-specific net profit thresholds
 NET_PROFIT_THRESHOLD_DIRECT      = 1.2   # Direct 2-leg trades — fee-justified floor (fees ~0.404% + net 0.5% + slip 0.3%)
@@ -834,11 +946,18 @@ if __name__ == "__main__":
     print(f"  Liquidity safe:         > {LIQUIDITY_RATIO_SIMULATE}x capital")
     print(f"  Jupiter platform fee:   {JUPITER_PLATFORM_FEE_PCT}% per leg")
     print(f"  Solana tx fee:          ${SOLANA_TX_FEE_USD:.4f} per tx")
+    _sol_price = float(os.getenv('SOL_PRICE_USD', '90.0'))
+    _live_tips = fetch_jito_tip_floor(_sol_price)
+    _live_usd  = _live_tips.get(PRIORITY_FEE_DEFAULT, PRIORITY_FEE_TIER.get(PRIORITY_FEE_DEFAULT, 0.0))
+    _tip_src   = _live_tips.get('source', 'fallback')
+    _tier_src  = 'from .env' if os.getenv('PRIORITY_FEE_TIER','').strip().lower() in PRIORITY_FEE_TIER else 'capital-based formula'
     print(f"  Priority fee tier:      {PRIORITY_FEE_DEFAULT} "
-          f"(${PRIORITY_FEE_TIER.get(PRIORITY_FEE_DEFAULT, 0.05):.2f} USD)")
-    print(f"  Priority fee tiers:     low=$0.01 | medium=$0.05 | "
-          f"high=$0.15 | desperate=$0.75")
-    print(f"  Set via .env:           PRIORITY_FEE_TIER=medium")
+          f"(${_live_usd:.5f} USD) — {_tier_src} / tip source: {_tip_src}")
+    print(f"  Tier mapping:           none=$0  low=EMA_p50  medium=p75  high=p95  desperate=p99")
+    print(f"  Capital formula:        $10-19=none  $20-60=low  $61-100=medium")
+    print(f"  Override via .env:      PRIORITY_FEE_TIER=none|low|medium|high|desperate")
+    print(f"  Live tip floor API:     {JITO_TIP_FLOOR_URL}")
+    print(f"  Cache TTL:              {JITO_CACHE_TTL_S}s  |  Timeout: {JITO_TIMEOUT_S}s")
     print(f"  Desired net profit:     {DESIRED_NET_PROFIT_PCT}%  (anchors slippage formula)")
     print(f"  Slippage formula:       (Gross - Fees - {DESIRED_NET_PROFIT_PCT}%) / 2")
     print(f"  Min gross/slip ratio:   {MIN_GROSS_SLIPPAGE_RATIO}:1  (3:1 rule of thumb)")

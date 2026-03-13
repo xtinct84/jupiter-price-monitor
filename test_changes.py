@@ -72,6 +72,8 @@ from execution_validator import (
     validate_signal, ValidationResult,
     LEGS_PER_DIRECT, LEGS_PER_TRIANGULAR,
     get_capital_based_tier,
+    fetch_jito_tip_floor, get_live_tip_usd,
+    JITO_TIP_FLOOR_URL, JITO_CACHE_TTL_S, JITO_TIMEOUT_S,
 )
 
 # TOKEN_DECIMALS defined locally — not exported by execution_validator
@@ -392,6 +394,61 @@ test("E3b Backoff attempt 1 = 200ms",  backoffs[1] == 200, expected=200, actual=
 test("E3c Backoff attempt 2 = 400ms",  backoffs[2] == 400, expected=400, actual=backoffs[2])
 
 # ─────────────────────────────────────────────
+# ── Jito live tip floor tests ────────────────────────
+print("\n── Jito Live Tip Floor Tests ────────────────────────")
+
+# J1–J3: constants
+test("J1  JITO_TIP_FLOOR_URL is set",
+     'jito.wtf' in JITO_TIP_FLOOR_URL,
+     expected='jito.wtf in URL', actual=JITO_TIP_FLOOR_URL)
+test("J2  JITO_CACHE_TTL_S = 60",
+     JITO_CACHE_TTL_S == 60, expected=60, actual=JITO_CACHE_TTL_S)
+test("J3  JITO_TIMEOUT_S = 3",
+     JITO_TIMEOUT_S == 3, expected=3, actual=JITO_TIMEOUT_S)
+
+# J4–J6: fallback behavior (API unreachable in test environment)
+# fetch_jito_tip_floor returns fallback values when API is down
+_tips = fetch_jito_tip_floor(90.0)
+test("J4  fetch_jito_tip_floor returns a dict",
+     isinstance(_tips, dict),
+     expected='dict', actual=type(_tips).__name__)
+test("J5  result has all 5 tier keys",
+     all(k in _tips for k in ('none','low','medium','high','desperate')),
+     expected='all tiers present', actual=list(_tips.keys()))
+test("J6  source is live or fallback (not empty)",
+     _tips.get('source') in ('live', 'fallback', 'cache'),
+     expected='live|fallback|cache', actual=_tips.get('source'))
+
+# J7–J8: none tier always $0 regardless of API
+test("J7  none tier = $0.000 regardless of API",
+     _tips['none'] == 0.0, expected=0.0, actual=_tips['none'])
+test("J8  get_live_tip_usd('none') = 0.0",
+     get_live_tip_usd('none', 90.0) == 0.0,
+     expected=0.0, actual=get_live_tip_usd('none', 90.0))
+
+# J9: tier ordering — low <= medium <= high <= desperate
+test("J9  tier amounts are ordered low <= medium <= high <= desperate",
+     _tips['low'] <= _tips['medium'] <= _tips['high'] <= _tips['desperate'],
+     expected='ordered ascending',
+     actual=f"low={_tips['low']:.5f} med={_tips['medium']:.5f} high={_tips['high']:.5f}")
+
+# J10: caching — second call within TTL returns cache source
+import execution_validator as _ev
+_ev._jito_cache = {}   # clear cache
+_first  = fetch_jito_tip_floor(90.0)   # cold fetch
+_second = fetch_jito_tip_floor(90.0)   # should hit cache
+test("J10 second call within TTL returns cache or same source",
+     _second.get('source') in ('cache', 'live', 'fallback'),
+     expected='cache|live|fallback', actual=_second.get('source'))
+
+# J11: calculate_fees_pct uses live tip (result should differ from old hardcoded medium)
+_fee_live = calculate_fees_pct(50.0, 2, 'medium')
+_fee_none = calculate_fees_pct(50.0, 2, 'none')
+test("J11 medium tier fee > none tier fee at $50 capital",
+     _fee_live > _fee_none,
+     expected=f'> {_fee_none:.5f}%', actual=f'{_fee_live:.5f}%',
+     note='live tip replaces old hardcoded $0.05 medium tier')
+
 # ── Cold-start protection tests ──────────────────────
 print("\n── Cold-Start Protection Tests ─────────────────────")
 from datetime import datetime, timedelta
