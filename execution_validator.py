@@ -50,7 +50,7 @@ TOKEN_DECIMALS = {
 }
 
 # Stage 1 — Gross divergence gate
-GROSS_DIVERGENCE_THRESHOLD = 1.5       # Minimum gross profit % to proceed
+GROSS_DIVERGENCE_THRESHOLD = 1.2       # Minimum gross profit % to proceed (fee-justified floor at $10–$100 capital)
 
 # Stage 2 — Liquidity ratio thresholds (depth / capital)
 LIQUIDITY_RATIO_REJECT     = 5.0       # Below this → reject immediately
@@ -114,8 +114,8 @@ PRIORITY_FEE_DEFAULT = (
 
 # Stage 5 — Execute gate
 # Strategy-specific net profit thresholds
-NET_PROFIT_THRESHOLD_DIRECT      = 1.5   # Direct 2-leg trades (rate divergence, impact anomaly)
-NET_PROFIT_THRESHOLD_TRIANGULAR  = 1.0   # Triangular 3-leg trades (higher fee burden, better MEV protection)
+NET_PROFIT_THRESHOLD_DIRECT      = 1.2   # Direct 2-leg trades — fee-justified floor (fees ~0.404% + net 0.5% + slip 0.3%)
+NET_PROFIT_THRESHOLD_TRIANGULAR  = 0.7   # Triangular 3-leg trades — lower due to multi-hop MEV protection reducing sandwich risk
 
 # 3:1 ratio formula constants
 DESIRED_NET_PROFIT_PCT     = 0.5       # Minimum acceptable net profit per trade
