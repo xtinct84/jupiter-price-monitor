@@ -30,8 +30,22 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 from execution_validator import enrich_signal_with_validation
+from dry_run_executor import DryRunExecutor, DRY_RUN_ENABLED
 
 load_dotenv()
+
+# Dry-run executor — instantiated once, reused across all signals
+# Only active when DRY_RUN=true in .env
+_dry_run_executor = None
+
+
+def _get_dry_run_executor():
+    """Lazy singleton — avoids JupiterAPI init overhead when DRY_RUN=false."""
+    global _dry_run_executor
+    if _dry_run_executor is None:
+        _dry_run_executor = DryRunExecutor()
+    return _dry_run_executor
+
 
 # In-memory duplicate cache — primary gate within a session
 # key = (pair, signal_type), value = datetime fired
@@ -1130,6 +1144,24 @@ async def run_detection():
         if (signal.get('weighted_score', 0) >= EXECUTE_THRESHOLD
                 and signal.get('execute_candidate', False)):
             await send_telegram_alert(signal)
+
+            # Dry-run simulation — fires alongside Telegram when DRY_RUN=true
+            # Records live entry quote, fees, and schedules exit price checks
+            if DRY_RUN_ENABLED:
+                try:
+                    executor = _get_dry_run_executor()
+                    asyncio.create_task(
+                        executor.simulate(
+                            signal,
+                            validation_result=signal.get('validation'),
+                        )
+                    )
+                    logger.info(
+                        f"📋 Dry run scheduled: {signal['pair']} | "
+                        f"capital=${executor.capital_usd:.2f}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Dry run scheduling failed: {e}")
         else:
             logger.info(
                 f"📵 No alert: {signal['pair']} | "
@@ -1181,6 +1213,8 @@ if __name__ == "__main__":
 
     telegram_status = "✅ Configured" if TELEGRAM_BOT_TOKEN else "⚠️  Not configured"
     print(f"  Telegram:           {telegram_status}")
+    dry_run_status = "✅ ENABLED — trades will be simulated" if DRY_RUN_ENABLED else "⬜ Disabled (set DRY_RUN=true to enable)"
+    print(f"  Dry run mode:       {dry_run_status}")
     print()
 
     asyncio.run(run_detection())

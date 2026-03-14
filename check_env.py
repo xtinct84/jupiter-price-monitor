@@ -101,4 +101,13 @@ if TRADE_CAPITAL_USD < 20:
      at this capital level — profitability requires larger
      divergence events than typical market conditions produce.
 """)
+dry_run = os.getenv('DRY_RUN','false').strip().lower()
+print("\n── Dry run mode ─────────────────────────────────────")
+if dry_run == 'true':
+    print("  DRY_RUN = true  ✅ — execute candidates will be paper traded")
+    print(f"  Results DB:    {os.getenv('DB_PATH','price_history/jupiter_monitor.db')}")
+    print(f"  Results log:   price_history/dry_run_log.jsonl")
+    print(f"  Summary:       python dry_run_executor.py")
+else:
+    print("  DRY_RUN = false  ⬜ — set DRY_RUN=true to enable paper trading")
 print("═" * 56)
